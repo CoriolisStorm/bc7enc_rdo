@@ -14,11 +14,23 @@
 #define BC7E_MAX_PARTITIONS7 (64)
 #define BC7E_MAX_UBER_LEVEL (4)
 
+#define BC7E_DEBUG_SPAM (0)
+
+// These are the values for "bc7e_compress_block_params::m_optimize_for"
+enum bc7e_optimize_for_what
+{
+	BC7E_OPTIMIZE_FOR_INDEPENDENT_CHANNELS,	// Optimize color and alpha as if each channel was independent (i.e., simply combining their errors with "m_weights").
+	BC7E_OPTIMIZE_FOR_COLOR_TIMES_ALPHA,	// Optimize color and alpha together to minimize change to "C A", where C/A are color/alpha. This ignores m_weights[3].
+	BC7E_OPTIMIZE_FOR_ALPHA_BLENDING,		// Optimize color and alpha together to minimize change to "C A + F (1 - A)", where C/A are color/alpha, and F is the frame buffer. This ignores m_weights[3].
+	BC7E_OPTIMIZE_FOR_ALPHA_TEST,			// Optimize color and alpha together to miinimize change to "A >= T ? C : F", where C/A are color/alpha, and T is a threshold.
+};
+
 typedef unsigned int8 uint8_t;
 typedef unsigned int64 uint16_t;
 typedef unsigned int32 uint32_t;
 typedef unsigned int64 uint64_t;
 typedef int8 int8_t;
+typedef int16 int16_t;
 typedef int int32_t;
 typedef int64 int64_t;
 
@@ -26,8 +38,8 @@ typedef int64 int64_t;
 #define UINT16_MAX (0xFFFF)
 #endif
 
-#ifndef UINT_MAX
-#define UINT_MAX (0xFFFFFFFFU)
+#ifndef UINT32_MAX
+#define UINT32_MAX (0xFFFFFFFFU)
 #endif
 
 #ifndef UINT64_MAX
@@ -38,11 +50,29 @@ typedef int64 int64_t;
 #define INT64_MAX (0x7FFFFFFFFFFFFFFFULL)
 #endif
 
+#ifndef INT32_MAX
+#define INT32_MAX (0x7FFFFFFFU)
+#endif
+
+#ifndef FLT_MAX
+#define FLT_MAX (3.402823466e+38f)
+#endif
+
+#if BC7E_DEBUG_SPAM
+#define DEBUG_SPAM(params, ...) if (!(params)->m_debug_spam) {} else print( __VA_ARGS__ )	// Include "fmt" as part of "..." so that no print args works
+#define DEBUG_SPAM_CODE(params, statement) if (!(params)->m_debug_spam) {} else statement
+#else
+#define DEBUG_SPAM(params, ...) (params)
+#define DEBUG_SPAM_CODE(params, statement) (params)
+#endif
+
 struct bc7e_compress_block_params
 {
 	uint32_t m_max_partitions_mode[8];
 
-	uint32_t m_weights[4];
+	float m_weights[4];
+	float m_alpha_test_threshold_min;	// Only used if "m_optimize_for == BC7E_OPTIMIZE_FOR_ALPHA_TEST". Normal alpha test sets min == max.
+	float m_alpha_test_threshold_max;	// Only used if "m_optimize_for == BC7E_OPTIMIZE_FOR_ALPHA_TEST". Normal alpha test sets min == max.
 
 	uint32_t m_uber_level;
 	uint32_t m_refinement_passes;
@@ -51,11 +81,13 @@ struct bc7e_compress_block_params
 	uint32_t m_mode4_index_mask;
 	uint32_t m_mode5_rotation_mask;
 	uint32_t m_uber1_mask;
+
+	bc7e_optimize_for_what m_optimize_for;
 	
 	bool m_perceptual;
 	bool m_pbit_search;
 	bool m_mode6_only;
-	bool m_unused0;
+	bool m_debugSpam;
 	
 	struct
 	{
@@ -69,7 +101,7 @@ struct bc7e_compress_block_params
 	struct
 	{
 		uint32_t m_max_mode7_partitions_to_try;
-		uint32_t m_mode67_error_weight_mul[4];
+		float m_mode67_error_weight_mul[4];
 				
 		bool m_use_mode4;
 		bool m_use_mode5;
@@ -82,6 +114,8 @@ struct bc7e_compress_block_params
 		bool m_unused3;
 	} m_alpha_settings;
 
+	// If you want the block total squared error results, set this to an array. If not, leave it NULL.
+	float* m_block_error_metric_results;
 };
 
 static inline uniform int32_t clampi(uniform int32_t value, uniform int32_t low, uniform int32_t high) { return clamp(value, low, high); }
@@ -208,10 +242,73 @@ static inline bool color_quad_i_notequals(const varying color_quad_i * uniform p
 	return !color_quad_i_equals(pLHS, pRHS);
 }
 
+static inline float copysign(float value, float sign)
+{
+	return floatbits(intbits(value) | (intbits(sign) & 0x80000000));
+}
+
+struct vec3F
+{
+	float m_c[3];
+};
+
 struct vec4F
 {
 	float m_c[4];
 };
+
+static inline void vec3F_set_scalar(uniform vec3F * uniform pV, uniform float x)
+{
+	pV->m_c[0] = x;
+	pV->m_c[1] = x;
+	pV->m_c[2] = x;
+}
+
+static inline varying vec3F * uniform vec3F_set(varying vec3F * uniform pV, float x, float y, float z)
+{
+	pV->m_c[0] = x;
+	pV->m_c[1] = y;
+	pV->m_c[2] = z;
+	return pV;
+}
+
+static inline void vec3F_accum(varying vec3F * uniform pLHS, const varying vec3F * uniform pRHS)
+{
+	pLHS->m_c[0] += pRHS->m_c[0];
+	pLHS->m_c[1] += pRHS->m_c[1];
+	pLHS->m_c[2] += pRHS->m_c[2];
+}
+
+static inline float vec3F_dot(const uniform vec3F * uniform pLHS, const varying vec3F * uniform pRHS)
+{
+	return pLHS->m_c[0] * pRHS->m_c[0] + pLHS->m_c[1] * pRHS->m_c[1] + pLHS->m_c[2] * pRHS->m_c[2];
+}
+
+static inline float vec3F_dot(const varying vec3F * uniform pLHS, const varying vec3F * uniform pRHS)
+{
+	return pLHS->m_c[0] * pRHS->m_c[0] + pLHS->m_c[1] * pRHS->m_c[1] + pLHS->m_c[2] * pRHS->m_c[2];
+}
+
+static inline vec3F vec3F_mul(const uniform vec3F * uniform pLHS, float s)
+{
+	vec3F res;
+	vec3F_set(&res, pLHS->m_c[0] * s, pLHS->m_c[1] * s, pLHS->m_c[2] * s);
+	return res;
+}
+
+static inline vec3F vec3F_mul(const varying vec3F * uniform pLHS, float s)
+{
+	vec3F res;
+	vec3F_set(&res, pLHS->m_c[0] * s, pLHS->m_c[1] * s, pLHS->m_c[2] * s);
+	return res;
+}
+
+static inline vec3F vec3F_mul(const varying vec3F * uniform pLHS, const uniform vec3F * uniform pRHS)
+{
+	vec3F res;
+	vec3F_set(&res, pLHS->m_c[0] * pRHS->m_c[0], pLHS->m_c[1] * pRHS->m_c[1], pLHS->m_c[2] * pRHS->m_c[2]);
+	return res;
+}
 
 static inline varying vec4F * uniform vec4F_set_scalar(varying vec4F * uniform pV, float x)
 {
@@ -300,17 +397,33 @@ static inline varying vec4F *vec4F_normalize_in_place(varying vec4F * uniform pV
 	return pV;
 }
 
+// This "pseudo-normalizes" the vector. The results are machine independent and are "near" unit length while being faster than normalizing.
+static inline varying vec4F *vec4F_pseudo_normalize_in_place(varying vec4F * uniform pV)
+{
+	float peak = max(max(max(abs(pV->m_c[0]), abs(pV->m_c[1])), abs(pV->m_c[2])), abs(pV->m_c[3]));
+	float s = 1.0f / max(peak, 1.0e-20f);
+	pV->m_c[0] *= s;
+	pV->m_c[1] *= s;
+	pV->m_c[2] *= s;
+	pV->m_c[3] *= s;
+
+	return pV;
+}
+
 static const uniform uint32_t g_bc7_weights2[4] = { 0, 21, 43, 64 };
 static const uniform uint32_t g_bc7_weights3[8] = { 0, 9, 18, 27, 37, 46, 55, 64 };
 static const uniform uint32_t g_bc7_weights4[16] = { 0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64 };
 
 // Precomputed weight constants used during least fit determination. For each entry in g_bc7_weights[]: w * w, (1.0f - w) * w, (1.0f - w) * (1.0f - w), w
-static const uniform float g_bc7_weights2x[4 * 4] = { 0.000000f, 0.000000f, 1.000000f, 0.000000f, 0.107666f, 0.220459f, 0.451416f, 0.328125f, 0.451416f, 0.220459f, 0.107666f, 0.671875f, 1.000000f, 0.000000f, 0.000000f, 1.000000f };
-static const uniform float g_bc7_weights3x[8 * 4] = { 0.000000f, 0.000000f, 1.000000f, 0.000000f, 0.019775f, 0.120850f, 0.738525f, 0.140625f, 0.079102f, 0.202148f, 0.516602f, 0.281250f, 0.177979f, 0.243896f, 0.334229f, 0.421875f, 0.334229f, 0.243896f, 0.177979f, 0.578125f, 0.516602f, 0.202148f,
-	0.079102f, 0.718750f, 0.738525f, 0.120850f, 0.019775f, 0.859375f, 1.000000f, 0.000000f, 0.000000f, 1.000000f };
-static const uniform float g_bc7_weights4x[16 * 4] = { 0.000000f, 0.000000f, 1.000000f, 0.000000f, 0.003906f, 0.058594f, 0.878906f, 0.062500f, 0.019775f, 0.120850f, 0.738525f, 0.140625f, 0.041260f, 0.161865f, 0.635010f, 0.203125f, 0.070557f, 0.195068f, 0.539307f, 0.265625f, 0.107666f, 0.220459f,
-	0.451416f, 0.328125f, 0.165039f, 0.241211f, 0.352539f, 0.406250f, 0.219727f, 0.249023f, 0.282227f, 0.468750f, 0.282227f, 0.249023f, 0.219727f, 0.531250f, 0.352539f, 0.241211f, 0.165039f, 0.593750f, 0.451416f, 0.220459f, 0.107666f, 0.671875f, 0.539307f, 0.195068f, 0.070557f, 0.734375f,
-	0.635010f, 0.161865f, 0.041260f, 0.796875f, 0.738525f, 0.120850f, 0.019775f, 0.859375f, 0.878906f, 0.058594f, 0.003906f, 0.937500f, 1.000000f, 0.000000f, 0.000000f, 1.000000f };
+// Using a macro to initialize this table is easier to understand and more accurate than using 6-digit floats. 6-digit floats have 2 ULPs error for most
+// of these constants, making them use 23 bits as a float, whereas the exact constants need at most 12 bits. The exact constants should always give exact
+// results for the determinant calculation in least squares solving, whereas 6-digit floats would have small truncation error. This *could* lead to cases
+// where exact weights would have a zero determinant, but 6-digit weights would have an epsilon determinant. I didn't actually see any such cases, but I
+// have seen enough rare problems from precision issues that I always like to maximize floating point precision.
+#define LSQWTS(n)	n * n / 4096.0f, (64 - n) * n / 4096.0f, (64 - n) * (64 - n) / 4096.0f, n / 64.0f
+static const uniform float g_bc7_weights2x[4 * 4] = { LSQWTS(0), LSQWTS(21), LSQWTS(43), LSQWTS(64) };
+static const uniform float g_bc7_weights3x[8 * 4] = { LSQWTS(0), LSQWTS(9), LSQWTS(18), LSQWTS(27), LSQWTS(37), LSQWTS(46), LSQWTS(55), LSQWTS(64) };
+static const uniform float g_bc7_weights4x[16 * 4] = { LSQWTS(0), LSQWTS(4), LSQWTS(9), LSQWTS(13), LSQWTS(17), LSQWTS(21), LSQWTS(26), LSQWTS(30), LSQWTS(34), LSQWTS(38), LSQWTS(43), LSQWTS(47), LSQWTS(51), LSQWTS(55), LSQWTS(60), LSQWTS(64) };
 
 static const uniform int g_bc7_partition1[16] = { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 };
 
@@ -805,11 +918,100 @@ struct color_cell_compressor_params
 	const uint32_t *uniform m_pSelector_weights;
 	const vec4F *uniform m_pSelector_weightsx;
 	uniform uint32_t m_comp_bits;
-	uniform uint32_t m_weights[4];
-	uniform bool m_has_alpha;
+	uniform float m_weights[4];
+	uniform float m_frame_buffer_other_value;	// If "m_optimize_for_color_times_alpha", this is 0 to optimize "C * A" (simple multiply) and 255 to optimize "C * A + F * (1 - A)" (alpha blend).
+	uniform uint32_t m_rotation;				// If not zero, alpha was swapped with channel "m_rotation - 1" (weights are also swapped).
+	uniform bool m_has_alpha;					// Only true for mode 6 or 7 in blocks with alpha. Opaque blocks set this to false for mode 6 and never use mode 7.
 	uniform bool m_has_pbits;
 	uniform bool m_endpoints_share_pbit;
 	uniform bool m_perceptual;
+	uniform bool m_optimize_for_color_times_alpha;	// Set for BC7E_OPTIMIZE_FOR_COLOR_TIMES_ALPHA, BC7E_OPTIMIZE_FOR_ALPHA_BLENDING, and for BC7E_OPTIMIZE_FOR_ALPHA_TEST.
+
+	uniform bool m_debug_spam;
+
+	// This is for "m_perceptual && m_optimize_for_color_times_alpha". In that case we want the worst error between two colors in YCbCr
+	// *after* alpha blending with the frame buffer. We'll find this by first constructing a parallelepiped of all possible errors, and
+	// choosing the furthest from the origin. One corner of the error parallelepiped is the difference of the alpha-weighted colors in
+	// YCbCr. From there, we add the parallelepiped for all RGB colors, scaled by the delta in "1 - alpha". In other words, we subtract
+	// the RGB parallelepiped scaled by alpha. Finally we scale each YCbCr axis by the square root of its weight, and the worst error is
+	// the extremal point on the resulting shape.
+	//
+	// From this construction, we can see that the closest point can be a corner, edge, or face, but the furthest point is always at a
+	// corner. If you are at an edge or a face, there is always at least one direction you can move that will increase distance. We want
+	// the furthest point, so we only care about corners.
+	//
+	// Since it's a parallelepiped, we can describe it as the sum of a set of three basis vectors. In fact, we can trivially get those
+	// vectors from the transform to YCbCr space and the YCbCr weights. The transform to YCbCr is:
+	//    Y  = k_Y_R  * R + k_Y_G  * G + k_Y_B  * B
+	//    Cb = k_Cb_R * R + k_Cr_G * G + k_Cr_B * B = (B - Y) * k_norm_Cb
+	//    Cr = k_Cr_R * R + k_Cb_G * G + k_Cb_B * B = (R - Y) * k_norm_Cr
+	// The parallelepiped vectors are thus:
+	//    Vr = {k_Y_R * sqrt(wtY), k_Cb_R * sqrt(wtCb), k_Cr_R * sqrt(wtCr)} * 255
+	//    Vg = {k_Y_G * sqrt(wtY), k_Cb_G * sqrt(wtCb), k_Cr_G * sqrt(wtCr)} * 255
+	//    Vb = {k_Y_B * sqrt(wtY), k_Cb_B * sqrt(wtCb), k_Cr_B * sqrt(wtCr)} * 255
+	// Of course, these vectors can be precalculated. If the base delta is D, then the eight possible corners C are:
+	//    C = D + da (r Vr + g Vg + b Vb)
+	// Where r, g, and b can independently be either 0 or 1. The question is, what is the maximum value of |C|^2?
+	//
+	// To find the furthest corner, we will move to the middle of the parallelepiped using:
+	//    M = D + da * ((Vr + Vg + Vb) * 0.5)
+	// "Vr + Vg + Vb" can be precalculated, and lots of terms cancel:
+	//    (Vr + Vg + Vb).Y = (k_Y_R + k_Y_G + k_Y_B) * sqrt(wtY) * 255 = sqrt(wtY) * 255
+	//    (Vr + Vg + Vb).Cb = (k_Cb_R + k_Cb_G + k_Cb_B) * sqrt(wtCb) * 255 = 0
+	//    (Vr + Vg + Vb).Cr = (k_Cr_R + k_Cr_G + k_Cr_B) * sqrt(wtCb) * 255 = 0
+	// The Cb and Cr terms must be 0 because they are scaled versions of (B - Y) and (R - Y), respectively. The Y weights sum to 1, and
+	// the weight on B/R is 1, and 1 - 1 = 0. So we can instead do:
+	//    M = D
+	//    M.Y += da * sqrt(wtY) * 255 * 0.5
+	//
+	// From there, the furthest corner can be found one parallelepiped axis at a time. If V_ . M > 0, we add V_, otherwise we subtract
+	// it. We can do this by copying the sign of "V_ . M" to "da" before scaling "V_" and accumulating. This takes us to the furthest
+	// corner, so we just dot that vector with itself to get the maximum distance. In math:
+	//    M += V_ * da * (V_ . M > 0 ? +1 : -1)
+	//
+	// NOTE: The code actually uses "Cr = R - Y" and "Cb = B - Y" for efficiency, and treats "k_norm_Cr" and "k_norm_Cb" as part of the
+	// weights for Cr and Cb. So, m_sqrt_weights for Cr and Cb must include these norms.
+	//
+	// NOTE: This derivation is for minimizing error when alpha blending (BC7E_OPTIMIZE_FOR_ALPHA_BLENDING). If we have alpha times color
+	// that is added to the frame buffer or replaces the frame buffer (BC7E_OPTIMIZE_FOR_COLOR_TIMES_ALPHA), then we just need to set Vr,
+	// Vg, and Vb to 0, and we can use the same code.
+
+	uniform vec3F m_sqrt_weights;
+	uniform vec3F m_dycrcb_r;		// This is "Vr" in the derivation above
+	uniform vec3F m_dycrcb_g;
+	uniform vec3F m_dycrcb_b;
+	uniform float m_dycrcb_mid;		// This is "(Vr + Vg + Vb) * 0.5" in the derivation above, which is 0 or sqrt(wtY) * 255 * 0.5
+
+	// For simplicity, BC7E_OPTIMIZE_FOR_ALPHA_TEST uses the code path for BC7E_OPTIMIZE_FOR_ALPHA_BLENDING, except that alpha has a ramp
+	// applied. Let the low threshold be L and the high threshold be H; for normal alpha teset, L == H. If the alpha is A, we can do:
+	//   H' = ceil(H)
+	//   L' = min(floor(L), H - 1)
+	//   A' = clamp((A - L') / (H' - L') * 255, 0, 255)
+	// The floor/ceil rounds the thresholds to an 8-bit representable value. The way we calculate L' guarantees the width is at least 1,
+	// and that L == H is interpreted as "A >= H".
+	//
+	// For example, if L == H == 127.5, then:
+	//   H' = 128
+	//   L' = 127
+	//   A' = clamp((A - 127) * 255, 0, 255)
+	// This implies that A' = 0 if A <= 127, and A' = 1 if A >= 128. The calculation for L' and H' guarantees that any value in (127,128]
+	// gives the same result.
+	//
+	// This can of course be precalculated:
+	//   m_alpha_scale = (alpha testing) ? 255 / (H' - L') : 1
+	//   m_alpha_bias = (alpha testing) ? L' : 0
+	//   A' = clamp((A - m_alpha_bias) * m_alpha_scale, 0, 255)
+	uniform float m_alpha_scale;
+	uniform float m_alpha_bias;
+};
+
+struct partition_estimate_params
+{
+	uniform float m_max_selector;
+	uniform float m_rcp_max_selector;
+	uniform float m_weights[4];
+
+	uniform bool m_debug_spam;
 };
 
 static inline void color_cell_compressor_params_clear(uniform color_cell_compressor_params *uniform p)
@@ -819,18 +1021,27 @@ static inline void color_cell_compressor_params_clear(uniform color_cell_compres
 	p->m_pSelector_weightsx = NULL;
 	p->m_comp_bits = 0;
 	p->m_perceptual = false;
-	p->m_weights[0] = 1;
-	p->m_weights[1] = 1;
-	p->m_weights[2] = 1;
-	p->m_weights[3] = 1;
+	p->m_optimize_for_color_times_alpha = false;
+	p->m_debug_spam = false;
+	p->m_weights[0] = 1.0f;
+	p->m_weights[1] = 1.0f;
+	p->m_weights[2] = 1.0f;
+	p->m_weights[3] = 1.0f;
+	p->m_frame_buffer_other_value = 0.0f;
+	p->m_rotation = 0;
 	p->m_has_alpha = false;
 	p->m_has_pbits = false;
 	p->m_endpoints_share_pbit = false;
+	vec3F_set_scalar(&p->m_sqrt_weights, 1);
+	vec3F_set_scalar(&p->m_dycrcb_r, 0);
+	vec3F_set_scalar(&p->m_dycrcb_g, 0);
+	vec3F_set_scalar(&p->m_dycrcb_b, 0);
+	p->m_dycrcb_mid = 0;
 }
 
 struct color_cell_compressor_results
 {
-	uint64_t m_best_overall_err;
+	float m_best_overall_err;
 	color_quad_i m_low_endpoint;
 	color_quad_i m_high_endpoint;
 	uint32_t m_pbits[2];
@@ -838,14 +1049,14 @@ struct color_cell_compressor_results
 	varying int *uniform m_pSelectors_temp;
 };
 
-static inline color_quad_i scale_color(const varying color_quad_i *uniform pC, const uniform color_cell_compressor_params *uniform pParams)
+static inline color_quad_i scale_color(const varying color_quad_i *uniform pC, const uniform color_cell_compressor_params *uniform pParams, uniform uint32_t num_channels)
 {
 	color_quad_i results;
 
 	const uint32_t n = pParams->m_comp_bits + (pParams->m_has_pbits ? 1 : 0);
 	assert((n >= 4) && (n <= 8));
 
-	for (uniform uint32_t i = 0; i < 4; i++)
+	for (uniform uint32_t i = 0; i < num_channels; i++)
 	{
 		uint32_t v = pC->m_c[i] << (8 - n);
 #pragma ignore warning(perf)
@@ -857,72 +1068,612 @@ static inline color_quad_i scale_color(const varying color_quad_i *uniform pC, c
 	return results;
 }
 
-static const float pr_weight = (.5f / (1.0f - .2126f)) * (.5f / (1.0f - .2126f));
-static const float pb_weight = (.5f / (1.0f - .0722f)) * (.5f / (1.0f - .0722f));
+#if 1
+// These are the standard weights to turn nonlinear sRGB to nonlinear sYCC.
+static const uniform float k_Y_R = 0.2990f;
+static const uniform float k_Y_G = 0.5870f;
+static const uniform float k_Y_B = 0.1140f;
+static const uniform int k_Y_R_int = 29;	// 29/97 = 0.2990
+static const uniform int k_Y_G_int = 57;	// 57/97 = 0.5876
+static const uniform int k_Y_B_int = 11;	// 11/97 = 0.1134
+#else
+// These are the standard weights to turn linear RGB to linear YCbCr.
+// The "best" luminance results would be to turn sRGB to linear RGB to get linear Y, and then convert that back to gamma space.
+// A good and much faster approximation of this is to square RGB, convert to Y with these weights, then take the square root of that.
+// This better accounts for the non-linearity of brightness perception, but it makes the compression math non-linear and slower.
+static const uniform float k_Y_R = 0.2126f;
+static const uniform float k_Y_G = 0.7152f;
+static const uniform float k_Y_B = 0.0722f;
+static const uniform int k_Y_R_int = 29;	// 29/137 = 0.2117
+static const uniform int k_Y_G_int = 98;	// 98/137 = 0.7153
+static const uniform int k_Y_B_int = 10;	// 10/137 = 0.0730
+static const uniform int k_Y_R_int = 44;	//  44/207 = 0.2126
+static const uniform int k_Y_G_int = 148;	// 148/207 = 0.7150
+static const uniform int k_Y_B_int = 15;	//  15/207 = 0.0725
+#endif
 
-static inline uint64_t compute_color_distance_rgb(const varying color_quad_i * uniform pE1, const varying color_quad_i *uniform pE2, uniform bool perceptual, const uint32_t uniform weights[4])
+// Conveniently, for both these transforms, we have:
+//   Cb = (B - Y) * 0.5 / (1 - k_Y_B)
+//   Cr = (R - Y) * 0.5 / (1 - k_Y_R)
+
+static const uniform float k_norm_Cb = 0.5f / (1.0f - k_Y_B);	//  0.5643  or   0.5389
+static const uniform float k_norm_Cr = 0.5f / (1.0f - k_Y_R);	//  0.7133  or   0.6350
+
+static const uniform float k_Cb_R = -k_Y_R * k_norm_Cb;			// -0.1687  or  -0.1146 
+static const uniform float k_Cb_G = -k_Y_G * k_norm_Cb;			// -0.3313  or  -0.3854
+static const uniform float k_Cb_B = 0.5f;						//  0.5 by design
+
+static const uniform float k_Cr_R = 0.5f;						//  0.5 by design
+static const uniform float k_Cr_G = -k_Y_G * k_norm_Cr;			// -0.4187  or  -0.4542
+static const uniform float k_Cr_B = -k_Y_B * k_norm_Cr;			// -0.0813  or  -0.0458
+
+static const uniform float pr_weight = k_norm_Cr * k_norm_Cr;	//  0.5087  or   0.4032
+static const uniform float pb_weight = k_norm_Cb * k_norm_Cb;	//  0.3185  or   0.2904
+
+// We choose the partition by estimating error using a super cheap color line fit to the colors in the different subsets. When using
+// perceptual error, we need new weights (using the perceptual weights as if they were RGB weights will obviously give bad results).
+// We could use the RGB weights for Y in YCbCr, but that ignores chroma. By blending in uniform weights, we give some small weight to
+// chroma, but heavily prefer luminance. Experimentally, I found the sweet spot was to blend the Y channel's RGB weights and uniform
+// weights in a 10:1 ratio. This worked best to minimize total squared error across a variety of settings for YCbCr channel error
+// weights and across both definitions of the YCbCr transform. The difference in total squared error was 0.03% or less for various
+// ratios, so the exact ratio doesn't matter much. The difference from uniform weights to YCbCr weights was about 2%, so using better
+// weights does matter a lot.
+//
+// Incidentally, I tried pre-transforming the block to YCbCr space once and then doing the color estimation for every partition in
+// that space. The color partition error estimate code didn't change, but now it worked directly in YCbCr space, so it minimized
+// YCbCr error, and could use the given YCbCr weights. This had really bad results; total YCbCr error in the final image increased
+// by about 3%! This was surprising, because the RGB to YCbCr transform is linear, so the color line in one space should map to the
+// same color line in the other space, but now you could estimate error in the same space as you measure final error, so now you can
+// accurately account for chroma. However, it was worse! I did experiment to see if the loss of precision in calculating covariance
+// mattered. Covariance is exact in floating point math for the unmodified RGB values, but not if we've converted to another color
+// space where terms now use more than 8 mantissa bits. If the conversion rounds the last mantissa bit, we've already lost precision.
+// It turns out precision didn't matter; using doubles for covariance and an epsilon around zero for the sign check had about 0.01%
+// impact on total error, but should have made the math give the same results as infinite precision for the vast majority of blocks.
+// So the only other difference I see in running the same code in two different color spaces is the color line it chooses. In both
+// spaces it connects opposite corners of the color bounding box. My theory is that the color line you get by connecting corners of
+// the RGB bounding box is much better than the color line from connecting corners of the YCbCr bounding box at approximating the
+// optimal color line, and the more accurate line matters more than the more accurate error estimate. 
+
+static const uniform int k_Y_int_sum = k_Y_R_int + k_Y_G_int + k_Y_B_int;
+static const uniform int est_ratio = 10;
+static const uniform int k_est_wt_r = k_Y_R_int * est_ratio + k_Y_int_sum;
+static const uniform int k_est_wt_g = k_Y_G_int * est_ratio + k_Y_int_sum;
+static const uniform int k_est_wt_b = k_Y_B_int * est_ratio + k_Y_int_sum;
+static const uniform int k_est_wt_a = ((k_est_wt_r + k_est_wt_g + k_est_wt_b) * 2) / 3;	// alpha uses about twice the average rgb weight
+
+static inline float remap_alpha(const uniform color_cell_compressor_params *uniform pParams, const varying float alpha)
 {
-	if (perceptual)
+	return clamp((alpha - pParams->m_alpha_bias) * pParams->m_alpha_scale, 0.0f, 255.0f);
+}
+
+static float compute_color_distance_rgb(const uniform color_cell_compressor_params *uniform pParams, const varying color_quad_i * uniform pSolid, uint32_t num_pixels, const varying color_quad_i *uniform pPixels)
+{
+	if (pParams->m_perceptual)
 	{
-		const float l1 = pE1->m_c[0] * .2126f + pE1->m_c[1] * .7152f + pE1->m_c[2] * .0722f;
-		const float cr1 = pE1->m_c[0] - l1;
-		const float cb1 = pE1->m_c[2] - l1;
+		const float sy = pSolid->m_c[0] * k_Y_R + pSolid->m_c[1] * k_Y_G + pSolid->m_c[2] * k_Y_B;
+		const float scr = pSolid->m_c[0] - sy;
+		const float scb = pSolid->m_c[2] - sy;
 
-		const float l2 = pE2->m_c[0] * .2126f + pE2->m_c[1] * .7152f + pE2->m_c[2] * .0722f;
-		const float cr2 = pE2->m_c[0] - l2;
-		const float cb2 = pE2->m_c[2] - l2;
+		float sum_dy_dy = 0.0f;
+		float sum_dcr_dcr = 0.0f;
+		float sum_dcb_dcb = 0.0f;
+		for (uniform uint32_t i = 0; i < num_pixels; i++)
+		{
+			const float iy = pPixels[i].m_c[0] * k_Y_R + pPixels[i].m_c[1] * k_Y_G + pPixels[i].m_c[2] * k_Y_B;
+			const float icr = pPixels[i].m_c[0] - iy;
+			const float icb = pPixels[i].m_c[2] - iy;
 
-		float dl = l1 - l2;
-		float dcr = cr1 - cr2;
-		float dcb = cb1 - cb2;
+			float dy = iy - sy;
+			float dcr = icr - scr;
+			float dcb = icb - scb;
 
-		return (int64_t)(weights[0] * (dl * dl) + weights[1] * pr_weight * (dcr * dcr) + weights[2] * pb_weight * (dcb * dcb));
+			sum_dy_dy += dy * dy;
+			sum_dcr_dcr += dcr * dcr;
+			sum_dcb_dcb += dcb * dcb;
+		}
+		return pParams->m_weights[0] * sum_dy_dy + pParams->m_weights[1] * (pr_weight * sum_dcr_dcr) + pParams->m_weights[2] * (pb_weight * sum_dcb_dcb);
 	}
 	else
 	{
-		float dr = (float)pE1->m_c[0] - (float)pE2->m_c[0];
-		float dg = (float)pE1->m_c[1] - (float)pE2->m_c[1];
-		float db = (float)pE1->m_c[2] - (float)pE2->m_c[2];
-		
-		return (int64_t)(weights[0] * dr * dr + weights[1] * dg * dg + weights[2] * db * db);
+		const int16_t sr = pSolid->m_c[0];
+		const int16_t sg = pSolid->m_c[1];
+		const int16_t sb = pSolid->m_c[2];
+
+		int32_t sum_dr_dr = 0;
+		int32_t sum_dg_dg = 0;
+		int32_t sum_db_db = 0;
+		for (uniform uint32_t i = 0; i < num_pixels; i++)
+		{
+			int16_t dr = pPixels[i].m_c[0] - sr;
+			int16_t dg = pPixels[i].m_c[1] - sg;
+			int16_t db = pPixels[i].m_c[2] - sb;
+
+			uint16_t drSq = dr * dr;	// conversion to unsigned keeps full precision of a 16-bit multiply
+			uint16_t dgSq = dg * dg;
+			uint16_t dbSq = db * db;
+
+			sum_dr_dr += drSq;
+			sum_dg_dg += dgSq;
+			sum_db_db += dbSq;
+		}
+		const float w0_dr = pParams->m_weights[0] * (float)sum_dr_dr;
+		const float w1_dg = pParams->m_weights[1] * (float)sum_dg_dg;
+		const float w2_db = pParams->m_weights[2] * (float)sum_db_db;
+		return w0_dr + w1_dg + w2_db;
 	}
 }
 
-static inline uint64_t compute_color_distance_rgba(const varying color_quad_i *uniform pE1, const varying color_quad_i *uniform pE2, uniform bool perceptual, const uint32_t uniform weights[4])
+static inline float accum_color_distance_rgba_perceptual_color_times_alpha(const uniform color_cell_compressor_params *uniform pParams, const varying color_quad_i * uniform pPixel, float sy, float scr, float scb, float sa)
 {
-	float da = (float)pE1->m_c[3] - (float)pE2->m_c[3];
-	float a_err = weights[3] * (da * da);
+	const float ir = pPixel->m_c[0];
+	const float ig = pPixel->m_c[1];
+	const float ib = pPixel->m_c[2];
+	const float ia = remap_alpha(pParams, pPixel->m_c[3]);
 
-	if (perceptual)
+	const float iy = ir * k_Y_R + ig * k_Y_G + ib * k_Y_B;
+	const float icr = ir - iy;
+	const float icb = ib - iy;
+	const float da = ia - sa;
+
+	const float dy = iy * ia - sy * sa;
+	const float dcr = icr * ia - scr * sa;
+	const float dcb = icb * ia - scb * sa;
+
+	vec3F point;
+	point.m_c[0] = dy * pParams->m_sqrt_weights.m_c[0] + da * pParams->m_dycrcb_mid;
+	point.m_c[1] = dcr * pParams->m_sqrt_weights.m_c[1];
+	point.m_c[2] = dcb * pParams->m_sqrt_weights.m_c[2];
+
+	vec3F delta_r = vec3F_mul(&pParams->m_dycrcb_r, copysign(da, vec3F_dot(&pParams->m_dycrcb_r, &point)));
+	vec3F delta_g = vec3F_mul(&pParams->m_dycrcb_g, copysign(da, vec3F_dot(&pParams->m_dycrcb_g, &point)));
+	vec3F delta_b = vec3F_mul(&pParams->m_dycrcb_b, copysign(da, vec3F_dot(&pParams->m_dycrcb_b, &point)));
+
+	vec3F_accum(&point, &delta_r);
+	vec3F_accum(&point, &delta_g);
+	vec3F_accum(&point, &delta_b);
+					
+	return vec3F_dot(&point, &point);
+}
+
+static float compute_color_distance_rgba(const uniform color_cell_compressor_params *uniform pParams, const varying color_quad_i * uniform pSolid, uint32_t num_pixels, const varying color_quad_i *uniform pPixels)
+{
+	if (pParams->m_perceptual)
 	{
-		const float l1 = pE1->m_c[0] * .2126f + pE1->m_c[1] * .7152f + pE1->m_c[2] * .0722f;
-		const float cr1 = pE1->m_c[0] - l1;
-		const float cb1 = pE1->m_c[2] - l1;
+		if (pParams->m_optimize_for_color_times_alpha)
+		{
+			const float sr = pSolid->m_c[0];
+			const float sg = pSolid->m_c[1];
+			const float sb = pSolid->m_c[2];
+			const float sa = remap_alpha(pParams, pSolid->m_c[3]);
 
-		const float l2 = pE2->m_c[0] * .2126f + pE2->m_c[1] * .7152f + pE2->m_c[2] * .0722f;
-		const float cr2 = pE2->m_c[0] - l2;
-		const float cb2 = pE2->m_c[2] - l2;
+			const float sy = sr * k_Y_R + sg * k_Y_G + sb * k_Y_B;
+			const float scr = sr - sy;
+			const float scb = sb - sy;
 
-		float dl = l1 - l2;
-		float dcr = cr1 - cr2;
-		float dcb = cb1 - cb2;
+			float total_err = 0.0f;
+			for (uniform uint32_t i = 0; i < num_pixels; i++)
+			{
+				total_err += accum_color_distance_rgba_perceptual_color_times_alpha(pParams, &pPixels[i], sy, scr, scb, sa);
+			}
+			total_err *= (1.0f / (255.0f * 255.0f));
+			return total_err;
+		}
+		else
+		{
+			const float sl = pSolid->m_c[0] * k_Y_R + pSolid->m_c[1] * k_Y_G + pSolid->m_c[2] * k_Y_B;
+			const float scr = pSolid->m_c[0] - sl;
+			const float scb = pSolid->m_c[2] - sl;
+			const int16_t sa = pSolid->m_c[3];
 
-		return (int64_t)(weights[0] * (dl * dl) + weights[1] * pr_weight * (dcr * dcr) + weights[2] * pb_weight * (dcb * dcb) + a_err);
+			float sum_dl_dl = 0.0f;
+			float sum_dcr_dcr = 0.0f;
+			float sum_dcb_dcb = 0.0f;
+			int32_t sum_da_da = 0;
+			for (uniform uint32_t i = 0; i < num_pixels; i++)
+			{
+				const float il = pPixels[i].m_c[0] * k_Y_R + pPixels[i].m_c[1] * k_Y_G + pPixels[i].m_c[2] * k_Y_B;
+				const float icr = pPixels[i].m_c[0] - il;
+				const float icb = pPixels[i].m_c[2] - il;
+				const int16_t ia = pPixels[i].m_c[3];
+
+				float dl = il - sl;
+				float dcr = icr - scr;
+				float dcb = icb - scb;
+				int16_t da = ia - sa;
+
+				sum_dl_dl += dl * dl;
+				sum_dcr_dcr += dcr * dcr;
+				sum_dcb_dcb += dcb * dcb;
+				uint16_t daSq = da * da;	// conversion to unsigned keeps full precision of a 16-bit multiply
+				sum_da_da += daSq;
+			}
+
+			return pParams->m_weights[0] * sum_dl_dl + pParams->m_weights[1] * (pr_weight * sum_dcr_dcr) + pParams->m_weights[2] * (pb_weight * sum_dcb_dcb) + pParams->m_weights[3] * (float)sum_da_da;
+		}
 	}
 	else
 	{
-		float dr = (float)pE1->m_c[0] - (float)pE2->m_c[0];
-		float dg = (float)pE1->m_c[1] - (float)pE2->m_c[1];
-		float db = (float)pE1->m_c[2] - (float)pE2->m_c[2];
+		if (pParams->m_optimize_for_color_times_alpha)
+		{
+			assert(pParams->m_rotation == 0);
+			const float sa = remap_alpha(pParams, pSolid->m_c[3]);
+			const float sr_sa = pSolid->m_c[0] * sa;
+			const float sg_sa = pSolid->m_c[1] * sa;
+			const float sb_sa = pSolid->m_c[2] * sa;
+
+			float sum_dr_dr = 0;
+			float sum_dg_dg = 0;
+			float sum_db_db = 0;
+			for (uniform uint32_t i = 0; i < num_pixels; i++)
+			{
+				float ir = pPixels[i].m_c[0];
+				float ig = pPixels[i].m_c[1];
+				float ib = pPixels[i].m_c[2];
+				float ia = remap_alpha(pParams, pPixels[i].m_c[3]);
+
+				float dr_0 = ir * ia - sr_sa;
+				float dg_0 = ig * ia - sg_sa;
+				float db_0 = ib * ia - sb_sa;
+				float da_255 = pParams->m_frame_buffer_other_value * (ia - sa);
+
+				float dr = max(abs(dr_0), abs(dr_0 - da_255));
+				float dg = max(abs(dg_0), abs(dg_0 - da_255));
+				float db = max(abs(db_0), abs(db_0 - da_255));
+
+				sum_dr_dr += dr * dr;
+				sum_dg_dg += dg * dg;
+				sum_db_db += db * db;
+			}
+			const float total_err = (pParams->m_weights[0] * sum_dr_dr + pParams->m_weights[1] * sum_dg_dg + pParams->m_weights[2] * sum_db_db) * (1.0f / (255.0f * 255.0f));
+			return total_err;
+		}
+		else
+		{
+			const int16_t sr = pSolid->m_c[0];
+			const int16_t sg = pSolid->m_c[1];
+			const int16_t sb = pSolid->m_c[2];
+			const int16_t sa = pSolid->m_c[3];
+
+			int32_t sum_dr_dr = 0;
+			int32_t sum_dg_dg = 0;
+			int32_t sum_db_db = 0;
+			int32_t sum_da_da = 0;
+			for (uniform uint32_t i = 0; i < num_pixels; i++)
+			{
+				int16_t dr = pPixels[i].m_c[0] - sr;
+				int16_t dg = pPixels[i].m_c[1] - sg;
+				int16_t db = pPixels[i].m_c[2] - sb;
+				int16_t da = pPixels[i].m_c[3] - sa;
+
+				uint16_t drSq = dr * dr;	// conversion to unsigned keeps full precision of a 16-bit multiply
+				uint16_t dgSq = dg * dg;
+				uint16_t dbSq = db * db;
+				uint16_t daSq = da * da;
+
+				sum_dr_dr += drSq;
+				sum_dg_dg += dgSq;
+				sum_db_db += dbSq;
+				sum_da_da += daSq;
+			}
 		
-		return (int64_t)(weights[0] * dr * dr + weights[1] * dg * dg + weights[2] * db * db + a_err);
+			const float w0_dr = pParams->m_weights[0] * (float)sum_dr_dr;
+			const float w1_dg = pParams->m_weights[1] * (float)sum_dg_dg;
+			const float w2_db = pParams->m_weights[2] * (float)sum_db_db;
+			const float w3_da = pParams->m_weights[3] * (float)sum_da_da;
+			return w0_dr + w1_dg + w2_db + w3_da;
+		}
 	}
 }
 
-static uint64_t pack_mode1_to_one_color(const uniform color_cell_compressor_params *uniform pParams, varying color_cell_compressor_results *uniform pResults, uint32_t r, uint32_t g, uint32_t b, 
+static inline float convert_color_distance_rgb_to_ycrcb(float sum_dr_dr, float sum_dg_dg, float sum_db_db, float sum_dr_dg, float sum_dg_db, float sum_db_dr, uniform float wy, uniform float wcr, uniform float wcb)
+{
+	const uniform float ky_rr = k_Y_R * k_Y_R;
+	const uniform float ky_gg = k_Y_G * k_Y_G;
+	const uniform float ky_bb = k_Y_B * k_Y_B;
+	const uniform float ky_rg = k_Y_R * k_Y_G * 2;
+	const uniform float ky_gb = k_Y_G * k_Y_B * 2;
+	const uniform float ky_br = k_Y_B * k_Y_R * 2;
+
+	float sum_dy_dy = sum_dr_dr * ky_rr + sum_dg_dg * ky_gg + sum_db_db * ky_bb + sum_dr_dg * ky_rg + sum_dg_db * ky_gb + sum_db_dr * ky_br;
+
+	// sum_dcr_dcr is the same, except every constant is negated, and ky_r --> 1 - ky_r.
+	// If every term is negated the sign errors cancel, so we can use the "ky_*" constants if we just do ky_r --> ky_r - 1.
+	// sum_dcb_dcb is the same as sum_dcr_dcr, except we use ky_b --> ky_b - 1.
+	const uniform float kcr_rr = 2 * k_Y_R - 1;
+	const uniform float kcr_rg = 2 * k_Y_G;
+	const uniform float kcr_br = 2 * k_Y_B;
+	const uniform float kcb_bb = 2 * k_Y_B - 1;
+	const uniform float kcb_gb = 2 * k_Y_G;
+	const uniform float kcb_br = 2 * k_Y_R;
+
+	float sum_dcr_dcr = sum_dy_dy - sum_dr_dr * kcr_rr - sum_dr_dg * kcr_rg - sum_db_dr * kcr_br;
+	float sum_dcb_dcb = sum_dy_dy - sum_db_db * kcb_bb - sum_dg_db * kcb_gb - sum_db_dr * kcb_br;
+
+	return wy * sum_dy_dy + wcr * (pr_weight * sum_dcr_dcr) + wcb * (pb_weight * sum_dcb_dcb);
+}
+
+static float compute_color_distance_rgba_perceptual_with_rotation(const uniform color_cell_compressor_params *uniform pParams, const varying color_quad_i * uniform pSolid, uint32_t num_pixels, const varying color_quad_i *uniform pPixels, const varying int32_t *uniform pCompAlpha)
+{
+	assert(!pParams->m_optimize_for_color_times_alpha);
+	assert(pParams->m_perceptual);
+	assert(pParams->m_rotation != 0);
+	assert(pCompAlpha != NULL);
+	// Mode 4 and 5 have rotation. If this is non-zero, alpha is swapped with a color channel by the GPU. To reuse
+	// compression code, this is handled by swapping the channels in pPixels and the weights in pParams->m_weights.
+	// For alpha-blending aware error metrics, we need to get the channels back in the original spot, which means
+	// doing the same swap again.
+	//
+	// rotation 0:  RGB|A: no swap, handled above
+	// rotation 1:  AGB|R: chan_a = 0, chan_0 = 1, chan_1 = 2
+	// rotation 2:  RAB|G: chan_a = 1, chan_0 = 0, chan_1 = 2
+	// rotation 3:  RGA|B: chan_a = 2, chan_0 = 0, chan_1 = 1
+
+	uniform const int32_t chan_a = pParams->m_rotation - 1;
+	uniform const int32_t chan_0 = (3 - pParams->m_rotation) >> 1;
+	uniform const int32_t chan_1 = (6 - pParams->m_rotation) >> 1;
+
+	// In our naming scheme, s = source, i = iterator, 0-2 = color channel indexes (some permutation of RGB)
+	const float sa = pSolid->m_c[chan_a];
+	const float s0 = pSolid->m_c[chan_0];
+	const float s1 = pSolid->m_c[chan_1];
+
+	float sum_d0_d0 = 0;
+	float sum_d1_d1 = 0;
+	float sum_d2_d2 = 0;
+	float sum_d0_d1 = 0;
+	float sum_d1_d2 = 0;
+	float sum_d2_d0 = 0;
+	float sum_da_da = 0;
+	for (uniform uint32_t i = 0; i < num_pixels; i++)
+	{
+		float s2 = pCompAlpha[i];
+
+		float ia = pPixels[i].m_c[chan_a];
+		float i0 = pPixels[i].m_c[chan_0];
+		float i1 = pPixels[i].m_c[chan_1];
+		float i2 = pPixels[i].m_c[3];
+
+		float d0 = i0 - s0;
+		float d1 = i1 - s1;
+		float d2 = i2 - s2;
+		float da = ia - sa;
+
+		sum_d0_d0 += d0 * d0;
+		sum_d1_d1 += d1 * d1;
+		sum_d2_d2 += d2 * d2;
+		sum_d0_d1 += d0 * d1;
+		sum_d1_d2 += d1 * d2;
+		sum_d2_d0 += d2 * d0;
+		sum_da_da += da * da;
+	}
+
+/*
+	// This is included for reference. Doing the "ifs" will turn into masked selects between 3 options for each constant.
+	// The equivalent "unrolled" form below can use masked selects between 2 options for most constants, but it is not so
+	// easy to see that it is correct. The easiest way to see it's correct is to compare the "unrolled" form to the "if"
+	// form, and to compare the "if" form to the rotation logic above.
+	if (pParams->m_rotation == 1)
+	{
+		sum_dr_dr = sum_d2_d2;
+		sum_dg_dg = sum_d0_d0;
+		sum_db_db = sum_d1_d1;
+		sum_dr_dg = sum_d2_d0;
+		sum_dg_db = sum_d0_d1;
+		sum_db_dr = sum_d1_d2;
+		wy = pParams->weights[3];
+		wcb = pParams->weights[2];
+		wcr = pParams->weights[1];
+		wa = pParams->weights[0];
+	}
+	else if (pParams->m_rotation == 2)
+	{
+		sum_dr_dr = sum_d0_d0;
+		sum_dg_dg = sum_d2_d2;
+		sum_db_db = sum_d1_d1;
+		sum_dr_dg = sum_d2_d0;
+		sum_dg_db = sum_d1_d2;
+		sum_db_dr = sum_d0_d1;
+		wy = pParams->weights[0];
+		wcb = pParams->weights[2];
+		wcr = pParams->weights[3];
+		wa = pParams->weights[1];
+	}
+	else // pParams->m_rotation == 3
+	{
+		sum_dr_dr = sum_d0_d0;
+		sum_dg_dg = sum_d1_d1;
+		sum_db_db = sum_d2_d2;
+		sum_dr_dg = sum_d0_d1;
+		sum_dg_db = sum_d1_d2;
+		sum_db_dr = sum_d2_d0;
+		wy = pParams->weights[0];
+		wcb = pParams->weights[3];
+		wcr = pParams->weights[1];
+		wa = pParams->weights[2];
+	}
+*/
+	const float sum_dr_dr = (pParams->m_rotation == 1) ? sum_d2_d2 : sum_d0_d0;
+	const float sum_dg_dg = (pParams->m_rotation == 1) ? sum_d0_d0 : (pParams->m_rotation == 2) ? sum_d2_d2 : sum_d1_d1;
+	const float sum_db_db = (pParams->m_rotation == 3) ? sum_d2_d2 : sum_d1_d1;
+	const float sum_dr_dg = (pParams->m_rotation == 3) ? sum_d0_d1 : sum_d2_d0;
+	const float sum_dg_db = (pParams->m_rotation == 1) ? sum_d0_d1 : sum_d1_d2;
+	const float sum_db_dr = (pParams->m_rotation == 1) ? sum_d1_d2 : (pParams->m_rotation == 2) ? sum_d0_d1 : sum_d2_d0;
+	uniform const float wy = (pParams->m_rotation == 1) ? pParams->m_weights[3] : pParams->m_weights[0];
+	uniform const float wcb = (pParams->m_rotation == 3) ? pParams->m_weights[3] : pParams->m_weights[2];
+	uniform const float wcr = (pParams->m_rotation == 2) ? pParams->m_weights[3] : pParams->m_weights[1];
+	uniform const float wa = pParams->m_weights[pParams->m_rotation - 1];
+
+	return convert_color_distance_rgb_to_ycrcb(sum_dr_dr, sum_dg_dg, sum_db_db, sum_dr_dg, sum_dg_db, sum_db_dr, wy, wcr, wcb) + wa * sum_da_da;
+}
+
+static float compute_color_distance_rgba_color_times_alpha_with_rotation(const uniform color_cell_compressor_params *uniform pParams, const varying color_quad_i * uniform pSolid, uint32_t num_pixels, const varying color_quad_i *uniform pPixels, const varying int32_t *uniform pCompAlpha)
+{
+	assert(pParams->m_optimize_for_color_times_alpha);
+	assert(pCompAlpha != NULL);
+
+	if (pParams->m_perceptual)
+	{
+		float total_err = 0.0f;
+		if (pParams->m_rotation == 0)
+		{
+			const float sr = pSolid->m_c[0];
+			const float sg = pSolid->m_c[1];
+			const float sb = pSolid->m_c[2];
+
+			const float sy = sr * k_Y_R + sg * k_Y_G + sb * k_Y_B;
+			const float scr = sr - sy;
+			const float scb = sb - sy;
+
+			for (uniform uint32_t i = 0; i < num_pixels; i++)
+			{
+				const float sa = remap_alpha(pParams, pCompAlpha[i]);
+				total_err += accum_color_distance_rgba_perceptual_color_times_alpha(pParams, &pPixels[i], sy, scr, scb, sa);
+			}
+		}
+		else if (pParams->m_rotation == 1)
+		{
+			const float sa = remap_alpha(pParams, pSolid->m_c[0]);
+			const float sg = pSolid->m_c[1];
+			const float sb = pSolid->m_c[2];
+			const float sy_com = sg * k_Y_G + sb * k_Y_B;
+
+			for (uniform uint32_t i = 0; i < num_pixels; i++)
+			{
+				const float sr = pCompAlpha[i];
+				const float sy = sy_com + sr * k_Y_R;
+				const float scr = sr - sy;
+				const float scb = sb - sy;
+				total_err += accum_color_distance_rgba_perceptual_color_times_alpha(pParams, &pPixels[i], sy, scr, scb, sa);
+			}
+		}
+		else if (pParams->m_rotation == 2)
+		{
+			const float sr = pSolid->m_c[0];
+			const float sa = remap_alpha(pParams, pSolid->m_c[1]);
+			const float sb = pSolid->m_c[2];
+			const float sy_com = sr * k_Y_R + sb * k_Y_B;
+
+			for (uniform uint32_t i = 0; i < num_pixels; i++)
+			{
+				const float sg = pCompAlpha[i];
+				const float sy = sy_com + sg * k_Y_G;
+				const float scr = sr - sy;
+				const float scb = sb - sy;
+				total_err += accum_color_distance_rgba_perceptual_color_times_alpha(pParams, &pPixels[i], sy, scr, scb, sa);
+			}
+		}
+		else // pParams->m_rotation == 3
+		{
+			const float sr = pSolid->m_c[0];
+			const float sg = pSolid->m_c[1];
+			const float sa = remap_alpha(pParams, pSolid->m_c[2]);
+			const float sy_com = sr * k_Y_R + sg * k_Y_G;
+
+			for (uniform uint32_t i = 0; i < num_pixels; i++)
+			{
+				const float sb = pCompAlpha[i];
+				const float sy = sy_com + sb * k_Y_B;
+				const float scr = sr - sy;
+				const float scb = sb - sy;
+				total_err += accum_color_distance_rgba_perceptual_color_times_alpha(pParams, &pPixels[i], sy, scr, scb, sa);
+			}
+		}
+		total_err *= 1.0f / (255.0f * 255.0f);
+		return total_err;
+	}
+
+	if (pParams->m_rotation == 0)
+	{
+		// In our naming scheme, s = source, i = iterator, 0-2 = color channel indexes (some permutation of RGB)
+		const float sr = pSolid->m_c[0];
+		const float sg = pSolid->m_c[1];
+		const float sb = pSolid->m_c[2];
+
+		float sum_dr_dr = 0;
+		float sum_dg_dg = 0;
+		float sum_db_db = 0;
+		for (uniform uint32_t i = 0; i < num_pixels; i++)
+		{
+			float sa = remap_alpha(pParams, pCompAlpha[i]);
+
+			float ir = pPixels[i].m_c[0];
+			float ig = pPixels[i].m_c[1];
+			float ib = pPixels[i].m_c[2];
+			float ia = remap_alpha(pParams, pPixels[i].m_c[3]);
+
+			float dr_0 = ir * ia - sr * sa;
+			float dg_0 = ig * ia - sg * sa;
+			float db_0 = ib * ia - sb * sa;
+			float da_255 = pParams->m_frame_buffer_other_value * (ia - sa);
+
+			float dr = max(abs(dr_0), abs(dr_0 - da_255));
+			float dg = max(abs(dg_0), abs(dg_0 - da_255));
+			float db = max(abs(db_0), abs(db_0 - da_255));
+
+			sum_dr_dr += dr * dr;
+			sum_dg_dg += dg * dg;
+			sum_db_db += db * db;
+		}
+
+		const float total_err = (pParams->m_weights[0] * sum_dr_dr + pParams->m_weights[1] * sum_dg_dg + pParams->m_weights[2] * sum_db_db) * (1.0f / (255.0f * 255.0f));
+		return total_err;
+	}
+	else
+	{
+		// Mode 4 and 5 have rotation. If this is non-zero, alpha is swapped with a color channel by the GPU. To reuse
+		// compression code, this is handled by swapping the channels in pPixels and the weights in pParams->m_weights.
+		// For alpha-blending aware error metrics, we need to get the channels back in the original spot, which means
+		// doing the same swap again.
+		//
+		// rotation 0:  RGB|A: no swap, handled above
+		// rotation 1:  AGB|R: chan_a = 0, chan_0 = 1, chan_1 = 2
+		// rotation 2:  RAB|G: chan_a = 1, chan_0 = 0, chan_1 = 2
+		// rotation 3:  RGA|B: chan_a = 2, chan_0 = 0, chan_1 = 1
+
+		uniform const int32_t chan_a = pParams->m_rotation - 1;
+		uniform const int32_t chan_0 = (3 - pParams->m_rotation) >> 1;
+		uniform const int32_t chan_1 = (6 - pParams->m_rotation) >> 1;
+
+		// In our naming scheme, s = source, i = iterator, 0-2 = color channel indexes (some permutation of RGB)
+		const float sa = remap_alpha(pParams, pSolid->m_c[chan_a]);
+		const float s0 = pSolid->m_c[chan_0];
+		const float s1 = pSolid->m_c[chan_1];
+
+		float sum_d0_d0 = 0;
+		float sum_d1_d1 = 0;
+		float sum_d2_d2 = 0;
+		for (uniform uint32_t i = 0; i < num_pixels; i++)
+		{
+			float s2 = pCompAlpha[i];
+
+			float ia = remap_alpha(pParams, pPixels[i].m_c[chan_a]);
+			float i0 = pPixels[i].m_c[chan_0];
+			float i1 = pPixels[i].m_c[chan_1];
+			float i2 = pPixels[i].m_c[3];
+
+			float d0_0 = i0 * ia - s0 * sa;
+			float d1_0 = i1 * ia - s1 * sa;
+			float d2_0 = i2 * ia - s2 * sa;
+			float da_255 = pParams->m_frame_buffer_other_value * (ia - sa);
+
+			float d0 = max(abs(d0_0), abs(d0_0 - da_255));
+			float d1 = max(abs(d1_0), abs(d1_0 - da_255));
+			float d2 = max(abs(d2_0), abs(d2_0 - da_255));
+
+			sum_d0_d0 += d0 * d0;
+			sum_d1_d1 += d1 * d1;
+			sum_d2_d2 += d2 * d2;
+		}
+		float total_err = pParams->m_weights[chan_0] * sum_d0_d0 + pParams->m_weights[chan_1] * sum_d1_d1 + pParams->m_weights[3] * sum_d2_d2;
+		total_err *= 1.0f / (255.0f * 255.0f);
+		return total_err;
+	}
+}
+
+static float pack_mode1_to_one_color(const uniform color_cell_compressor_params *uniform pParams, varying color_cell_compressor_results *uniform pResults, uint32_t r, uint32_t g, uint32_t b, 
 	varying int *uniform pSelectors, uint32_t num_pixels, const varying color_quad_i *uniform pPixels)
 {
-	uint32_t best_err = UINT_MAX;
+	uint32_t best_err = UINT32_MAX;
 	uint32_t best_p = 0;
 
 	for (uniform uint32_t p = 0; p < 2; p++)
@@ -965,18 +1716,18 @@ static uint64_t pack_mode1_to_one_color(const uniform color_cell_compressor_para
 
 	p.m_c[3] = 255;
 
-	uint64_t total_err = 0;
-	for (uniform uint32_t i = 0; i < num_pixels; i++)
-		total_err += compute_color_distance_rgb(&p, &pPixels[i], pParams->m_perceptual, pParams->m_weights);
+	const float total_err = compute_color_distance_rgb(pParams, &p, num_pixels, pPixels);
 
 	pResults->m_best_overall_err = total_err;
 
 	return total_err;
 }
 
-static uint64_t pack_mode24_to_one_color(const uniform color_cell_compressor_params *uniform pParams, varying color_cell_compressor_results *uniform pResults, uint32_t r, uint32_t g, uint32_t b, 
-	varying int *uniform pSelectors, uint32_t num_pixels, const varying color_quad_i *uniform pPixels)
+static float pack_mode24_to_one_color(const uniform color_cell_compressor_params *uniform pParams, varying color_cell_compressor_results *uniform pResults, uint32_t r, uint32_t g, uint32_t b, 
+	varying int *uniform pSelectors, uint32_t num_pixels, const varying color_quad_i *uniform pPixels, const varying int32_t *uniform pCompAlpha)
 {
+	assert(pParams->m_rotation == 0 || pCompAlpha != NULL);
+
 	uint32_t er, eg, eb;
 
 	if (pParams->m_num_selector_weights == 8)
@@ -1016,19 +1767,23 @@ static uint64_t pack_mode24_to_one_color(const uniform color_cell_compressor_par
 	
 	p.m_c[3] = 255;
 
-	uint64_t total_err = 0;
-	for (uniform uint32_t i = 0; i < num_pixels; i++)
-		total_err += compute_color_distance_rgb(&p, &pPixels[i], pParams->m_perceptual, pParams->m_weights);
+	float total_err;
+	if (pCompAlpha != NULL && pParams->m_optimize_for_color_times_alpha)
+		total_err = compute_color_distance_rgba_color_times_alpha_with_rotation(pParams, &p, num_pixels, pPixels, pCompAlpha);
+	else if (pCompAlpha != NULL && pParams->m_rotation != 0 && pParams->m_perceptual)
+		total_err = compute_color_distance_rgba_perceptual_with_rotation(pParams, &p, num_pixels, pPixels, pCompAlpha);
+	else
+		total_err = compute_color_distance_rgb(pParams, &p, num_pixels, pPixels);
 
 	pResults->m_best_overall_err = total_err;
 
 	return total_err;
 }
 
-static uint64_t pack_mode0_to_one_color(const uniform color_cell_compressor_params *uniform pParams, varying color_cell_compressor_results *uniform pResults, uint32_t r, uint32_t g, uint32_t b, 
+static float pack_mode0_to_one_color(const uniform color_cell_compressor_params *uniform pParams, varying color_cell_compressor_results *uniform pResults, uint32_t r, uint32_t g, uint32_t b, 
 	varying int *uniform pSelectors, uint32_t num_pixels, const varying color_quad_i *uniform pPixels)
 {
-	uint32_t best_err = UINT_MAX;
+	uint32_t best_err = UINT32_MAX;
 	uint32_t best_p = 0;
 
 	for (uniform uint32_t p = 0; p < 4; p++)
@@ -1073,19 +1828,17 @@ static uint64_t pack_mode0_to_one_color(const uniform color_cell_compressor_para
 	
 	p.m_c[3] = 255;
 
-	uint64_t total_err = 0;
-	for (uniform uint32_t i = 0; i < num_pixels; i++)
-		total_err += compute_color_distance_rgb(&p, &pPixels[i], pParams->m_perceptual, pParams->m_weights);
+	const float total_err = compute_color_distance_rgb(pParams, &p, num_pixels, pPixels);
 
 	pResults->m_best_overall_err = total_err;
 
 	return total_err;
 }
 
-static uint64_t pack_mode6_to_one_color(const uniform color_cell_compressor_params *uniform pParams, varying color_cell_compressor_results *uniform pResults, uint32_t r, uint32_t g, uint32_t b, uint32_t a,
+static float pack_mode6_to_one_color(const uniform color_cell_compressor_params *uniform pParams, varying color_cell_compressor_results *uniform pResults, uint32_t r, uint32_t g, uint32_t b, uint32_t a,
 	varying int *uniform pSelectors, uint32_t num_pixels, const varying color_quad_i *uniform pPixels)
 {
-	uint32_t best_err = UINT_MAX;
+	uint32_t best_err = UINT32_MAX;
 	uint32_t best_p = 0;
 
 	for (uniform uint32_t p = 0; p < 4; p++)
@@ -1131,19 +1884,17 @@ static uint64_t pack_mode6_to_one_color(const uniform color_cell_compressor_para
 		p.m_c[i] = (low * (64 - g_bc7_weights4[BC7E_MODE_6_OPTIMAL_INDEX]) + high * g_bc7_weights4[BC7E_MODE_6_OPTIMAL_INDEX] + 32) >> 6;
 	}
 
-	uint64_t total_err = 0;
-	for (uniform uint32_t i = 0; i < num_pixels; i++)
-		total_err += compute_color_distance_rgba(&p, &pPixels[i], pParams->m_perceptual, pParams->m_weights);
+	const float total_err = compute_color_distance_rgba(pParams, &p, num_pixels, pPixels);
 
 	pResults->m_best_overall_err = total_err;
 
 	return total_err;
 }
 
-static uint64_t pack_mode7_to_one_color(const uniform color_cell_compressor_params *uniform pParams, varying color_cell_compressor_results *uniform pResults, uint32_t r, uint32_t g, uint32_t b, uint32_t a,
+static float pack_mode7_to_one_color(const uniform color_cell_compressor_params *uniform pParams, varying color_cell_compressor_results *uniform pResults, uint32_t r, uint32_t g, uint32_t b, uint32_t a,
 	varying int *uniform pSelectors, uint32_t num_pixels, const varying color_quad_i *uniform pPixels)
 {
-	uint32_t best_err = UINT_MAX;
+	uint32_t best_err = UINT32_MAX;
 	uint32_t best_p = 0;
 
 	for (uniform uint32_t p = 0; p < 4; p++)
@@ -1189,17 +1940,114 @@ static uint64_t pack_mode7_to_one_color(const uniform color_cell_compressor_para
 		p.m_c[i] = (low * (64 - g_bc7_weights2[BC7E_MODE_7_OPTIMAL_INDEX]) + high * g_bc7_weights2[BC7E_MODE_7_OPTIMAL_INDEX] + 32) >> 6;
 	}
 
-	uint64_t total_err = 0;
-	for (uniform uint32_t i = 0; i < num_pixels; i++)
-		total_err += compute_color_distance_rgba(&p, &pPixels[i], pParams->m_perceptual, pParams->m_weights);
+	float total_err = compute_color_distance_rgba(pParams, &p, num_pixels, pPixels);
 
 	pResults->m_best_overall_err = total_err;
 
 	return total_err;
 }
 
-static uint64_t evaluate_solution(const varying color_quad_i *uniform pLow, const varying color_quad_i *uniform pHigh, const varying uint32_t *uniform pbits, 
-	const uniform color_cell_compressor_params *uniform pParams, varying color_cell_compressor_results *uniform pResults, uint32_t num_pixels, const varying color_quad_i *uniform pPixels)
+static inline float evaluate_error_orthogonal(varying float qr, varying float qg, varying float qb, varying float pr, varying float pg, varying float pb, uniform float wr, uniform float wg, uniform float wb)
+{
+	float dr = qr - pr;
+	float dg = qg - pg;
+	float db = qb - pb;
+	return wr * dr * dr + wg * dg * dg + wb * db * db;
+}
+
+static inline float evaluate_error_orthogonal(varying float qr, varying float qg, varying float qb, varying float qa, varying float pr, varying float pg, varying float pb, varying float pa, uniform float wr, uniform float wg, uniform float wb, uniform float wa)
+{
+	float dr = qr - pr;
+	float dg = qg - pg;
+	float db = qb - pb;
+	float da = qa - pa;
+	return wr * dr * dr + wg * dg * dg + wb * db * db + wa * da * da;
+}
+
+static inline float evaluate_error_orthogonal(const varying color_quad_f *uniform paletteColor, varying float pr, varying float pg, varying float pb, varying float pa, uniform float wr, uniform float wg, uniform float wb, uniform float wa)
+{
+	return evaluate_error_orthogonal(paletteColor->m_c[0], paletteColor->m_c[1], paletteColor->m_c[2], paletteColor->m_c[3], pr, pg, pb, pa, wr, wg, wb, wa);
+}
+
+static inline float evaluate_error_orthogonal(const varying color_quad_f *varying paletteColor, varying float pr, varying float pg, varying float pb, varying float pa, uniform float wr, uniform float wg, uniform float wb, uniform float wa)
+{
+#pragma ignore warning(perf)
+	float qr = paletteColor->m_c[0];
+#pragma ignore warning(perf)
+	float qg = paletteColor->m_c[1];
+#pragma ignore warning(perf)
+	float qb = paletteColor->m_c[2];
+#pragma ignore warning(perf)
+	float qa = paletteColor->m_c[3];
+
+	return evaluate_error_orthogonal(qr, qg, qb, qa, pr, pg, pb, pa, wr, wg, wb, wa);
+}
+
+static inline float evaluate_error_alpha_blend(varying float qr, varying float qg, varying float qb, varying float qa, varying float pr, varying float pg, varying float pb, varying float pa, uniform float wr, uniform float wg, uniform float wb, uniform float wa, const uniform color_cell_compressor_params *uniform pParams)
+{
+	float da_255, dr_0, dg_0, db_0;
+	if (pParams->m_rotation == 0)
+	{
+		da_255 = pParams->m_frame_buffer_other_value * (remap_alpha(pParams, qa) - remap_alpha(pParams, pa));
+		dr_0 = qr * qa - pr * pa;
+		dg_0 = qg * qa - pg * pa;
+		db_0 = qb * qa - pb * pa;
+	}
+	else if (pParams->m_rotation == 1)
+	{
+		// r and a are swapped
+		da_255 = pParams->m_frame_buffer_other_value * (remap_alpha(pParams, qr) - remap_alpha(pParams, pr));
+		dr_0 = qa * qr - pa * pr;
+		dg_0 = qg * qr - pg * pr;
+		db_0 = qb * qr - pb * pr;
+		wr = wa;
+	}
+	else if (pParams->m_rotation == 2)
+	{
+		// g and a are swapped
+		da_255 = pParams->m_frame_buffer_other_value * (remap_alpha(pParams, qg) - remap_alpha(pParams, pg));
+		dr_0 = qr * qg - pr * pg;
+		dg_0 = qa * qg - pa * pg;
+		db_0 = qb * qg - pb * pg;
+		wg = wa;
+	}
+	else // pParams->m_rotation == 3
+	{
+		// b and a are swapped
+		da_255 = pParams->m_frame_buffer_other_value * (remap_alpha(pParams, qb) - remap_alpha(pParams, pb));
+		dr_0 = qr * qb - pr * pb;
+		dg_0 = qg * qb - pg * pb;
+		db_0 = qa * qb - pa * pb;
+		wb = wa;
+	}
+
+	const float dr = max(abs(dr_0), abs(dr_0 - da_255));
+	const float dg = max(abs(dg_0), abs(dg_0 - da_255));
+	const float db = max(abs(db_0), abs(db_0 - da_255));
+	return (wr * dr * dr + wg * dg * dg + wb * db * db) * (1.0f / (255.0f * 255.0f));
+}
+
+static inline float evaluate_error_alpha_blend(const varying color_quad_f *uniform paletteColor, varying float pr, varying float pg, varying float pb, varying float pa, uniform float wr, uniform float wg, uniform float wb, uniform float wa, const uniform color_cell_compressor_params *uniform pParams)
+{
+	return evaluate_error_alpha_blend(paletteColor->m_c[0], paletteColor->m_c[1], paletteColor->m_c[2], paletteColor->m_c[3], pr, pg, pb, pa, wr, wg, wb, wa, pParams);
+}
+
+static inline float evaluate_error_alpha_blend(const varying color_quad_f *varying paletteColor, varying float pr, varying float pg, varying float pb, varying float pa, uniform float wr, uniform float wg, uniform float wb, uniform float wa, const uniform color_cell_compressor_params *uniform pParams)
+{
+#pragma ignore warning(perf)
+	float qr = paletteColor->m_c[0];
+#pragma ignore warning(perf)
+	float qg = paletteColor->m_c[1];
+#pragma ignore warning(perf)
+	float qb = paletteColor->m_c[2];
+#pragma ignore warning(perf)
+	float qa = paletteColor->m_c[3];
+
+	return evaluate_error_alpha_blend(qr, qg, qb, qa, pr, pg, pb, pa, wr, wg, wb, wa, pParams);
+}
+
+static float evaluate_solution(const varying color_quad_i *uniform pLow, const varying color_quad_i *uniform pHigh, const varying uint32_t *uniform pbits, 
+	const uniform color_cell_compressor_params *uniform pParams, varying color_cell_compressor_results *uniform pResults, uint32_t num_pixels, const varying color_quad_i *uniform pPixels, const varying int32_t *uniform pCompAlpha)
 {
 	color_quad_i quantMinColor = *pLow;
 	color_quad_i quantMaxColor = *pHigh;
@@ -1227,18 +2075,19 @@ static uint64_t evaluate_solution(const varying color_quad_i *uniform pLow, cons
 		quantMaxColor.m_c[3] = (pHigh->m_c[3] << 1) | maxPBit;
 	}
 
-	color_quad_i actualMinColor = scale_color(&quantMinColor, pParams);
-	color_quad_i actualMaxColor = scale_color(&quantMaxColor, pParams);
+	const uniform uint32_t nc = pParams->m_has_alpha ? 4 : 3;
+	color_quad_i actualMinColor = scale_color(&quantMinColor, pParams, nc);
+	color_quad_i actualMaxColor = scale_color(&quantMaxColor, pParams, nc);
 
 	const uniform uint32_t N = pParams->m_num_selector_weights;
-	const uniform uint32_t nc = pParams->m_has_alpha ? 4 : 3;		
+	const uniform bool optimizeForColorTimesAlpha_SeparateAlpha = (pParams->m_optimize_for_color_times_alpha && pCompAlpha != NULL);
 
-	float total_errf = 0;
+	float total_err = 0;
 
-	float wr = pParams->m_weights[0];
-	float wg = pParams->m_weights[1];
-	float wb = pParams->m_weights[2];
-	float wa = pParams->m_weights[3];
+	uniform float wr = pParams->m_weights[0];
+	uniform float wg = pParams->m_weights[1];
+	uniform float wb = pParams->m_weights[2];
+	uniform float wa = pParams->m_weights[3];
 
 	color_quad_f weightedColors[16];
 	weightedColors[0].m_c[0] = actualMinColor.m_c[0];
@@ -1253,7 +2102,7 @@ static uint64_t evaluate_solution(const varying color_quad_i *uniform pLow, cons
 		
 	for (uniform uint32_t i = 1; i < (N - 1); i++)
 		for (uniform uint32_t j = 0; j < nc; j++)
-			weightedColors[i].m_c[j] = floor((weightedColors[0].m_c[j] * (64.0f - pParams->m_pSelector_weights[i]) + weightedColors[N - 1].m_c[j] * pParams->m_pSelector_weights[i] + 32) * (1.0f / 64.0f));
+			weightedColors[i].m_c[j] = round((weightedColors[0].m_c[j] * (64.0f - pParams->m_pSelector_weights[i]) + weightedColors[N - 1].m_c[j] * pParams->m_pSelector_weights[i]) * (1.0f / 64.0f));
 
 	if (!pParams->m_perceptual)
 	{
@@ -1282,35 +2131,58 @@ static uint64_t evaluate_solution(const varying color_quad_i *uniform pLow, cons
 					float g = pC->m_c[1];
 					float b = pC->m_c[2];
 
-					float best_sel = floor(((r * dr + lr) + (g * dg + lg) + (b * db + lb)) * f + .5f);
+					float best_sel = round(((r * dr + lr) + (g * dg + lg) + (b * db + lb)) * f);
 					best_sel = clamp(best_sel, (float)1, (float)(N - 1));
 
 					float best_sel0 = best_sel - 1;
 
-#pragma ignore warning(perf)
-					float dr0 = weightedColors[(int)best_sel0].m_c[0] - r;
+					float err0, err1;
+					if (optimizeForColorTimesAlpha_SeparateAlpha)
+					{
+						const float a = pC->m_c[3];
+						const float qa = pCompAlpha[i];
 
 #pragma ignore warning(perf)
-					float dg0 = weightedColors[(int)best_sel0].m_c[1] - g;
+						float qr0 = weightedColors[(int)best_sel0].m_c[0];
+#pragma ignore warning(perf)
+						float qg0 = weightedColors[(int)best_sel0].m_c[1];
+#pragma ignore warning(perf)
+						float qb0 = weightedColors[(int)best_sel0].m_c[2];
+
+						err0 = evaluate_error_alpha_blend(qr0, qg0, qb0, qa, r, g, b, a, wr, wg, wb, wa, pParams);
 
 #pragma ignore warning(perf)
-					float db0 = weightedColors[(int)best_sel0].m_c[2] - b;
+						float qr1 = weightedColors[(int)best_sel].m_c[0];
+#pragma ignore warning(perf)
+						float qg1 = weightedColors[(int)best_sel].m_c[1];
+#pragma ignore warning(perf)
+						float qb1 = weightedColors[(int)best_sel].m_c[2];
 
-					float err0 = wr * dr0 * dr0 + wg * dg0 * dg0 + wb * db0 * db0;
+						err1 = evaluate_error_alpha_blend(qr1, qg1, qb1, qa, r, g, b, a, wr, wg, wb, wa, pParams);
+					}
+					else
+					{
+#pragma ignore warning(perf)
+						float qr0 = weightedColors[(int)best_sel0].m_c[0] - r;
+#pragma ignore warning(perf)
+						float qg0 = weightedColors[(int)best_sel0].m_c[1] - g;
+#pragma ignore warning(perf)
+						float qb0 = weightedColors[(int)best_sel0].m_c[2] - b;
+
+						err0 = evaluate_error_orthogonal(qr0, qg0, qb0, r, g, b, wr, wg, wb);
 
 #pragma ignore warning(perf)
-					float dr1 = weightedColors[(int)best_sel].m_c[0] - r;
-
+						float qr1 = weightedColors[(int)best_sel].m_c[0];
 #pragma ignore warning(perf)
-					float dg1 = weightedColors[(int)best_sel].m_c[1] - g;
-
+						float qg1 = weightedColors[(int)best_sel].m_c[1];
 #pragma ignore warning(perf)
-					float db1 = weightedColors[(int)best_sel].m_c[2] - b;
+						float qb1 = weightedColors[(int)best_sel].m_c[2];
 
-					float err1 = wr * dr1 * dr1 + wg * dg1 * dg1 + wb * db1 * db1;
+						err1 = evaluate_error_orthogonal(qr1, qg1, qb1, r, g, b, wr, wg, wb);
+					}
 
 					float min_err = min(err0, err1);
-					total_errf += min_err;
+					total_err += min_err;
 					pResults->m_pSelectors_temp[i] = (int)select(min_err == err0, best_sel0, best_sel);
 				}
 			}
@@ -1325,64 +2197,127 @@ static uint64_t evaluate_solution(const varying color_quad_i *uniform pLow, cons
 					float best_err;
 					int best_sel;
 
+					if (optimizeForColorTimesAlpha_SeparateAlpha)
 					{
-						float dr0 = weightedColors[0].m_c[0] - pr;
-						float dg0 = weightedColors[0].m_c[1] - pg;
-						float db0 = weightedColors[0].m_c[2] - pb;
-						float err0 = wr * dr0 * dr0 + wg * dg0 * dg0 + wb * db0 * db0;
+						float pa = (float)pPixels[i].m_c[3];
+						float qa = pCompAlpha[i];
+						{
+							float qr0 = weightedColors[0].m_c[0];
+							float qg0 = weightedColors[0].m_c[1];
+							float qb0 = weightedColors[0].m_c[2];
+							float err0 = evaluate_error_alpha_blend(qr0, qg0, qb0, qa, pr, pg, pb, pa, wr, wg, wb, wa, pParams);
 
-						float dr1 = weightedColors[1].m_c[0] - pr;
-						float dg1 = weightedColors[1].m_c[1] - pg;
-						float db1 = weightedColors[1].m_c[2] - pb;
-						float err1 = wr * dr1 * dr1 + wg * dg1 * dg1 + wb * db1 * db1;
+							float qr1 = weightedColors[1].m_c[0];
+							float qg1 = weightedColors[1].m_c[1];
+							float qb1 = weightedColors[1].m_c[2];
+							float err1 = evaluate_error_alpha_blend(qr1, qg1, qb1, qa, pr, pg, pb, pa, wr, wg, wb, wa, pParams);
 
-						float dr2 = weightedColors[2].m_c[0] - pr;
-						float dg2 = weightedColors[2].m_c[1] - pg;
-						float db2 = weightedColors[2].m_c[2] - pb;
-						float err2 = wr * dr2 * dr2 + wg * dg2 * dg2 + wb * db2 * db2;
+							float qr2 = weightedColors[2].m_c[0];
+							float qg2 = weightedColors[2].m_c[1];
+							float qb2 = weightedColors[2].m_c[2];
+							float err2 = evaluate_error_alpha_blend(qr2, qg2, qb2, qa, pr, pg, pb, pa, wr, wg, wb, wa, pParams);
 
-						float dr3 = weightedColors[3].m_c[0] - pr;
-						float dg3 = weightedColors[3].m_c[1] - pg;
-						float db3 = weightedColors[3].m_c[2] - pb;
-						float err3 = wr * dr3 * dr3 + wg * dg3 * dg3 + wb * db3 * db3;
+							float qr3 = weightedColors[3].m_c[0];
+							float qg3 = weightedColors[3].m_c[1];
+							float qb3 = weightedColors[3].m_c[2];
+							float err3 = evaluate_error_alpha_blend(qr3, qg3, qb3, qa, pr, pg, pb, pa, wr, wg, wb, wa, pParams);
 
-						best_err = min(min(min(err0, err1), err2), err3);
+							best_err = min(min(min(err0, err1), err2), err3);
 									
-						best_sel = select(best_err == err1, 1, 0);
-						best_sel = select(best_err == err2, 2, best_sel);
-						best_sel = select(best_err == err3, 3, best_sel);
-					}
+							best_sel = select(best_err == err1, 1, 0);
+							best_sel = select(best_err == err2, 2, best_sel);
+							best_sel = select(best_err == err3, 3, best_sel);
+						}
 
+						{
+							float qr4 = weightedColors[4].m_c[0];
+							float qg4 = weightedColors[4].m_c[1];
+							float qb4 = weightedColors[4].m_c[2];
+							float err4 = evaluate_error_alpha_blend(qr4, qg4, qb4, qa, pr, pg, pb, pa, wr, wg, wb, wa, pParams);
+
+							float qr5 = weightedColors[5].m_c[0];
+							float qg5 = weightedColors[5].m_c[1];
+							float qb5 = weightedColors[5].m_c[2];
+							float err5 = evaluate_error_alpha_blend(qr5, qg5, qb5, qa, pr, pg, pb, pa, wr, wg, wb, wa, pParams);
+
+							float qr6 = weightedColors[6].m_c[0];
+							float qg6 = weightedColors[6].m_c[1];
+							float qb6 = weightedColors[6].m_c[2];
+							float err6 = evaluate_error_alpha_blend(qr6, qg6, qb6, qa, pr, pg, pb, pa, wr, wg, wb, wa, pParams);
+
+							float qr7 = weightedColors[7].m_c[0];
+							float qg7 = weightedColors[7].m_c[1];
+							float qb7 = weightedColors[7].m_c[2];
+							float err7 = evaluate_error_alpha_blend(qr7, qg7, qb7, qa, pr, pg, pb, pa, wr, wg, wb, wa, pParams);
+
+							best_err = min(best_err, min(min(min(err4, err5), err6), err7));
+
+							best_sel = select(best_err == err4, 4, best_sel);
+							best_sel = select(best_err == err5, 5, best_sel);
+							best_sel = select(best_err == err6, 6, best_sel);
+							best_sel = select(best_err == err7, 7, best_sel);
+						}
+					}
+					else
 					{
-						float dr0 = weightedColors[4].m_c[0] - pr;
-						float dg0 = weightedColors[4].m_c[1] - pg;
-						float db0 = weightedColors[4].m_c[2] - pb;
-						float err0 = wr * dr0 * dr0 + wg * dg0 * dg0 + wb * db0 * db0;
+						{
+							float qr0 = weightedColors[0].m_c[0];
+							float qg0 = weightedColors[0].m_c[1];
+							float qb0 = weightedColors[0].m_c[2];
+							float err0 = evaluate_error_orthogonal(qr0, qg0, qb0, pr, pg, pb, wr, wg, wb);
 
-						float dr1 = weightedColors[5].m_c[0] - pr;
-						float dg1 = weightedColors[5].m_c[1] - pg;
-						float db1 = weightedColors[5].m_c[2] - pb;
-						float err1 = wr * dr1 * dr1 + wg * dg1 * dg1 + wb * db1 * db1;
+							float qr1 = weightedColors[1].m_c[0];
+							float qg1 = weightedColors[1].m_c[1];
+							float qb1 = weightedColors[1].m_c[2];
+							float err1 = evaluate_error_orthogonal(qr1, qg1, qb1, pr, pg, pb, wr, wg, wb);
 
-						float dr2 = weightedColors[6].m_c[0] - pr;
-						float dg2 = weightedColors[6].m_c[1] - pg;
-						float db2 = weightedColors[6].m_c[2] - pb;
-						float err2 = wr * dr2 * dr2 + wg * dg2 * dg2 + wb * db2 * db2;
+							float qr2 = weightedColors[2].m_c[0];
+							float qg2 = weightedColors[2].m_c[1];
+							float qb2 = weightedColors[2].m_c[2];
+							float err2 = evaluate_error_orthogonal(qr2, qg2, qb2, pr, pg, pb, wr, wg, wb);
 
-						float dr3 = weightedColors[7].m_c[0] - pr;
-						float dg3 = weightedColors[7].m_c[1] - pg;
-						float db3 = weightedColors[7].m_c[2] - pb;
-						float err3 = wr * dr3 * dr3 + wg * dg3 * dg3 + wb * db3 * db3;
+							float qr3 = weightedColors[3].m_c[0];
+							float qg3 = weightedColors[3].m_c[1];
+							float qb3 = weightedColors[3].m_c[2];
+							float err3 = evaluate_error_orthogonal(qr3, qg3, qb3, pr, pg, pb, wr, wg, wb);
 
-						best_err = min(best_err, min(min(min(err0, err1), err2), err3));
+							best_err = min(min(min(err0, err1), err2), err3);
+									
+							best_sel = select(best_err == err1, 1, 0);
+							best_sel = select(best_err == err2, 2, best_sel);
+							best_sel = select(best_err == err3, 3, best_sel);
+						}
 
-						best_sel = select(best_err == err0, 4, best_sel);
-						best_sel = select(best_err == err1, 5, best_sel);
-						best_sel = select(best_err == err2, 6, best_sel);
-						best_sel = select(best_err == err3, 7, best_sel);
+						{
+							float qr4 = weightedColors[4].m_c[0];
+							float qg4 = weightedColors[4].m_c[1];
+							float qb4 = weightedColors[4].m_c[2];
+							float err4 = evaluate_error_orthogonal(qr4, qg4, qb4, pr, pg, pb, wr, wg, wb);
+
+							float qr5 = weightedColors[5].m_c[0];
+							float qg5 = weightedColors[5].m_c[1];
+							float qb5 = weightedColors[5].m_c[2];
+							float err5 = evaluate_error_orthogonal(qr5, qg5, qb5, pr, pg, pb, wr, wg, wb);
+
+							float qr6 = weightedColors[6].m_c[0];
+							float qg6 = weightedColors[6].m_c[1];
+							float qb6 = weightedColors[6].m_c[2];
+							float err6 = evaluate_error_orthogonal(qr6, qg6, qb6, pr, pg, pb, wr, wg, wb);
+
+							float qr7 = weightedColors[7].m_c[0];
+							float qg7 = weightedColors[7].m_c[1];
+							float qb7 = weightedColors[7].m_c[2];
+							float err7 = evaluate_error_orthogonal(qr7, qg7, qb7, pr, pg, pb, wr, wg, wb);
+
+							best_err = min(best_err, min(min(min(err4, err5), err6), err7));
+
+							best_sel = select(best_err == err4, 4, best_sel);
+							best_sel = select(best_err == err5, 5, best_sel);
+							best_sel = select(best_err == err6, 6, best_sel);
+							best_sel = select(best_err == err7, 7, best_sel);
+						}
 					}
-				
-					total_errf += best_err;
+					total_err += best_err;
 
 					pResults->m_pSelectors_temp[i] = best_sel;
 				}
@@ -1394,26 +2329,55 @@ static uint64_t evaluate_solution(const varying color_quad_i *uniform pLow, cons
 					float pr = (float)pPixels[i].m_c[0];
 					float pg = (float)pPixels[i].m_c[1];
 					float pb = (float)pPixels[i].m_c[2];
-				
-					float dr0 = weightedColors[0].m_c[0] - pr;
-					float dg0 = weightedColors[0].m_c[1] - pg;
-					float db0 = weightedColors[0].m_c[2] - pb;
-					float err0 = wr * dr0 * dr0 + wg * dg0 * dg0 + wb * db0 * db0;
 
-					float dr1 = weightedColors[1].m_c[0] - pr;
-					float dg1 = weightedColors[1].m_c[1] - pg;
-					float db1 = weightedColors[1].m_c[2] - pb;
-					float err1 = wr * dr1 * dr1 + wg * dg1 * dg1 + wb * db1 * db1;
+					float err0, err1, err2, err3;
+					if (optimizeForColorTimesAlpha_SeparateAlpha)
+					{
+						float pa = (float)pPixels[i].m_c[3];
+						float qa = pCompAlpha[i];
 
-					float dr2 = weightedColors[2].m_c[0] - pr;
-					float dg2 = weightedColors[2].m_c[1] - pg;
-					float db2 = weightedColors[2].m_c[2] - pb;
-					float err2 = wr * dr2 * dr2 + wg * dg2 * dg2 + wb * db2 * db2;
+						float qr0 = weightedColors[0].m_c[0];
+						float qg0 = weightedColors[0].m_c[1];
+						float qb0 = weightedColors[0].m_c[2];
+						err0 = evaluate_error_alpha_blend(qr0, qg0, qb0, qa, pr, pg, pb, pa, wr, wg, wb, wa, pParams);
 
-					float dr3 = weightedColors[3].m_c[0] - pr;
-					float dg3 = weightedColors[3].m_c[1] - pg;
-					float db3 = weightedColors[3].m_c[2] - pb;
-					float err3 = wr * dr3 * dr3 + wg * dg3 * dg3 + wb * db3 * db3;
+						float qr1 = weightedColors[1].m_c[0];
+						float qg1 = weightedColors[1].m_c[1];
+						float qb1 = weightedColors[1].m_c[2];
+						err1 = evaluate_error_alpha_blend(qr1, qg1, qb1, qa, pr, pg, pb, pa, wr, wg, wb, wa, pParams);
+
+						float qr2 = weightedColors[2].m_c[0];
+						float qg2 = weightedColors[2].m_c[1];
+						float qb2 = weightedColors[2].m_c[2];
+						err2 = evaluate_error_alpha_blend(qr2, qg2, qb2, qa, pr, pg, pb, pa, wr, wg, wb, wa, pParams);
+
+						float qr3 = weightedColors[3].m_c[0];
+						float qg3 = weightedColors[3].m_c[1];
+						float qb3 = weightedColors[3].m_c[2];
+						err3 = evaluate_error_alpha_blend(qr3, qg3, qb3, qa, pr, pg, pb, pa, wr, wg, wb, wa, pParams);
+					}
+					else
+					{
+						float qr0 = weightedColors[0].m_c[0];
+						float qg0 = weightedColors[0].m_c[1];
+						float qb0 = weightedColors[0].m_c[2];
+						err0 = evaluate_error_orthogonal(qr0, qg0, qb0, pr, pg, pb, wr, wg, wb);
+
+						float qr1 = weightedColors[1].m_c[0];
+						float qg1 = weightedColors[1].m_c[1];
+						float qb1 = weightedColors[1].m_c[2];
+						err1 = evaluate_error_orthogonal(qr1, qg1, qb1, pr, pg, pb, wr, wg, wb);
+
+						float qr2 = weightedColors[2].m_c[0];
+						float qg2 = weightedColors[2].m_c[1];
+						float qb2 = weightedColors[2].m_c[2];
+						err2 = evaluate_error_orthogonal(qr2, qg2, qb2, pr, pg, pb, wr, wg, wb);
+
+						float qr3 = weightedColors[3].m_c[0];
+						float qg3 = weightedColors[3].m_c[1];
+						float qb3 = weightedColors[3].m_c[2];
+						err3 = evaluate_error_orthogonal(qr3, qg3, qb3, pr, pg, pb, wr, wg, wb);
+					}
 
 					float best_err = min(min(min(err0, err1), err2), err3);
 
@@ -1421,7 +2385,7 @@ static uint64_t evaluate_solution(const varying color_quad_i *uniform pLow, cons
 					best_sel = select(best_err == err2, 2, best_sel);
 					best_sel = select(best_err == err3, 3, best_sel);
 								
-					total_errf += best_err;
+					total_err += best_err;
 
 					pResults->m_pSelectors_temp[i] = best_sel;
 				}
@@ -1457,34 +2421,25 @@ static uint64_t evaluate_solution(const varying color_quad_i *uniform pLow, cons
 					float b = pC->m_c[2];
 					float a = pC->m_c[3];
 
-					float best_sel = floor(((r * dr + lr) + (g * dg + lg) + (b * db + lb) + (a * da + la)) * f + .5f);
+					float best_sel = round(((r * dr + lr) + (g * dg + lg) + (b * db + lb) + (a * da + la)) * f);
 					best_sel = clamp(best_sel, (float)1, (float)(N - 1));
 
 					float best_sel0 = best_sel - 1;
 
-#pragma ignore warning(perf)
-					float dr0 = weightedColors[(int)best_sel0].m_c[0] - r;
-#pragma ignore warning(perf)
-					float dg0 = weightedColors[(int)best_sel0].m_c[1] - g;
-#pragma ignore warning(perf)
-					float db0 = weightedColors[(int)best_sel0].m_c[2] - b;
-#pragma ignore warning(perf)
-					float da0 = weightedColors[(int)best_sel0].m_c[3] - a;
-					float err0 = (wr * dr0 * dr0) + (wg * dg0 * dg0) + (wb * db0 * db0) + (wa * da0 * da0);
-
-#pragma ignore warning(perf)
-					float dr1 = weightedColors[(int)best_sel].m_c[0] - r;
-#pragma ignore warning(perf)
-					float dg1 = weightedColors[(int)best_sel].m_c[1] - g;
-#pragma ignore warning(perf)
-					float db1 = weightedColors[(int)best_sel].m_c[2] - b;
-#pragma ignore warning(perf)
-					float da1 = weightedColors[(int)best_sel].m_c[3] - a;
-
-					float err1 = (wr * dr1 * dr1) + (wg * dg1 * dg1) + (wb * db1 * db1) + (wa * da1 * da1);
+					float err0, err1;
+					if (pParams->m_optimize_for_color_times_alpha)
+					{
+						err0 = evaluate_error_alpha_blend(&weightedColors[(int)best_sel0], r, g, b, a, wr, wg, wb, wa, pParams);
+						err1 = evaluate_error_alpha_blend(&weightedColors[(int)best_sel], r, g, b, a, wr, wg, wb, wa, pParams);
+					}
+					else
+					{
+						err0 = evaluate_error_orthogonal(&weightedColors[(int)best_sel0], r, g, b, a, wr, wg, wb, wa);
+						err1 = evaluate_error_orthogonal(&weightedColors[(int)best_sel], r, g, b, a, wr, wg, wb, wa);
+					}
 
 					float min_err = min(err0, err1);
-					total_errf += min_err;
+					total_err += min_err;
 					pResults->m_pSelectors_temp[i] = (int)select(min_err == err0, best_sel0, best_sel);
 				}
 			}
@@ -1500,72 +2455,64 @@ static uint64_t evaluate_solution(const varying color_quad_i *uniform pLow, cons
 					float best_err;
 					int best_sel;
 
+					if (pParams->m_optimize_for_color_times_alpha)
 					{
-						float dr0 = weightedColors[0].m_c[0] - pr;
-						float dg0 = weightedColors[0].m_c[1] - pg;
-						float db0 = weightedColors[0].m_c[2] - pb;
-						float da0 = weightedColors[0].m_c[3] - pa;
-						float err0 = wr * dr0 * dr0 + wg * dg0 * dg0 + wb * db0 * db0 + wa * da0 * da0;
+						{
+							float err0 = evaluate_error_alpha_blend(&weightedColors[0], pr, pg, pb, pa, wr, wg, wb, wa, pParams);
+							float err1 = evaluate_error_alpha_blend(&weightedColors[1], pr, pg, pb, pa, wr, wg, wb, wa, pParams);
+							float err2 = evaluate_error_alpha_blend(&weightedColors[2], pr, pg, pb, pa, wr, wg, wb, wa, pParams);
+							float err3 = evaluate_error_alpha_blend(&weightedColors[3], pr, pg, pb, pa, wr, wg, wb, wa, pParams);
 
-						float dr1 = weightedColors[1].m_c[0] - pr;
-						float dg1 = weightedColors[1].m_c[1] - pg;
-						float db1 = weightedColors[1].m_c[2] - pb;
-						float da1 = weightedColors[1].m_c[3] - pa;
-						float err1 = wr * dr1 * dr1 + wg * dg1 * dg1 + wb * db1 * db1 + wa * da1 * da1;
+							best_err = min(min(min(err0, err1), err2), err3);
+										
+							best_sel = select(best_err == err1, 1, 0);
+							best_sel = select(best_err == err2, 2, best_sel);
+							best_sel = select(best_err == err3, 3, best_sel);
+						}
+						{
+							float err4 = evaluate_error_alpha_blend(&weightedColors[4], pr, pg, pb, pa, wr, wg, wb, wa, pParams);
+							float err5 = evaluate_error_alpha_blend(&weightedColors[5], pr, pg, pb, pa, wr, wg, wb, wa, pParams);
+							float err6 = evaluate_error_alpha_blend(&weightedColors[6], pr, pg, pb, pa, wr, wg, wb, wa, pParams);
+							float err7 = evaluate_error_alpha_blend(&weightedColors[7], pr, pg, pb, pa, wr, wg, wb, wa, pParams);
 
-						float dr2 = weightedColors[2].m_c[0] - pr;
-						float dg2 = weightedColors[2].m_c[1] - pg;
-						float db2 = weightedColors[2].m_c[2] - pb;
-						float da2 = weightedColors[2].m_c[3] - pa;
-						float err2 = wr * dr2 * dr2 + wg * dg2 * dg2 + wb * db2 * db2 + wa * da2 * da2;
+							best_err = min(best_err, min(min(min(err4, err5), err6), err7));
 
-						float dr3 = weightedColors[3].m_c[0] - pr;
-						float dg3 = weightedColors[3].m_c[1] - pg;
-						float db3 = weightedColors[3].m_c[2] - pb;
-						float da3 = weightedColors[3].m_c[3] - pa;
-						float err3 = wr * dr3 * dr3 + wg * dg3 * dg3 + wb * db3 * db3 + wa * da3 * da3;
-
-						best_err = min(min(min(err0, err1), err2), err3);
-									
-						best_sel = select(best_err == err1, 1, 0);
-						best_sel = select(best_err == err2, 2, best_sel);
-						best_sel = select(best_err == err3, 3, best_sel);
+							best_sel = select(best_err == err4, 4, best_sel);
+							best_sel = select(best_err == err5, 5, best_sel);
+							best_sel = select(best_err == err6, 6, best_sel);
+							best_sel = select(best_err == err7, 7, best_sel);
+						}
 					}
-
+					else
 					{
-						float dr0 = weightedColors[4].m_c[0] - pr;
-						float dg0 = weightedColors[4].m_c[1] - pg;
-						float db0 = weightedColors[4].m_c[2] - pb;
-						float da0 = weightedColors[4].m_c[3] - pa;
-						float err0 = wr * dr0 * dr0 + wg * dg0 * dg0 + wb * db0 * db0 + wa * da0 * da0;
+						{
+							float err0 = evaluate_error_orthogonal(&weightedColors[0], pr, pg, pb, pa, wr, wg, wb, wa);
+							float err1 = evaluate_error_orthogonal(&weightedColors[1], pr, pg, pb, pa, wr, wg, wb, wa);
+							float err2 = evaluate_error_orthogonal(&weightedColors[2], pr, pg, pb, pa, wr, wg, wb, wa);
+							float err3 = evaluate_error_orthogonal(&weightedColors[3], pr, pg, pb, pa, wr, wg, wb, wa);
 
-						float dr1 = weightedColors[5].m_c[0] - pr;
-						float dg1 = weightedColors[5].m_c[1] - pg;
-						float db1 = weightedColors[5].m_c[2] - pb;
-						float da1 = weightedColors[5].m_c[3] - pa;
-						float err1 = wr * dr1 * dr1 + wg * dg1 * dg1 + wb * db1 * db1 + wa * da1 * da1;
+							best_err = min(min(min(err0, err1), err2), err3);
+										
+							best_sel = select(best_err == err1, 1, 0);
+							best_sel = select(best_err == err2, 2, best_sel);
+							best_sel = select(best_err == err3, 3, best_sel);
+						}
+						{
+							float err4 = evaluate_error_orthogonal(&weightedColors[4], pr, pg, pb, pa, wr, wg, wb, wa);
+							float err5 = evaluate_error_orthogonal(&weightedColors[5], pr, pg, pb, pa, wr, wg, wb, wa);
+							float err6 = evaluate_error_orthogonal(&weightedColors[6], pr, pg, pb, pa, wr, wg, wb, wa);
+							float err7 = evaluate_error_orthogonal(&weightedColors[7], pr, pg, pb, pa, wr, wg, wb, wa);
 
-						float dr2 = weightedColors[6].m_c[0] - pr;
-						float dg2 = weightedColors[6].m_c[1] - pg;
-						float db2 = weightedColors[6].m_c[2] - pb;
-						float da2 = weightedColors[6].m_c[3] - pa;
-						float err2 = wr * dr2 * dr2 + wg * dg2 * dg2 + wb * db2 * db2 + wa * da2 * da2;
+							best_err = min(best_err, min(min(min(err4, err5), err6), err7));
 
-						float dr3 = weightedColors[7].m_c[0] - pr;
-						float dg3 = weightedColors[7].m_c[1] - pg;
-						float db3 = weightedColors[7].m_c[2] - pb;
-						float da3 = weightedColors[7].m_c[3] - pa;
-						float err3 = wr * dr3 * dr3 + wg * dg3 * dg3 + wb * db3 * db3 + wa * da3 * da3;
-
-						best_err = min(best_err, min(min(min(err0, err1), err2), err3));
-
-						best_sel = select(best_err == err0, 4, best_sel);
-						best_sel = select(best_err == err1, 5, best_sel);
-						best_sel = select(best_err == err2, 6, best_sel);
-						best_sel = select(best_err == err3, 7, best_sel);
+							best_sel = select(best_err == err4, 4, best_sel);
+							best_sel = select(best_err == err5, 5, best_sel);
+							best_sel = select(best_err == err6, 6, best_sel);
+							best_sel = select(best_err == err7, 7, best_sel);
+						}
 					}
 				
-					total_errf += best_err;
+					total_err += best_err;
 
 					pResults->m_pSelectors_temp[i] = best_sel;
 				}
@@ -1579,37 +2526,37 @@ static uint64_t evaluate_solution(const varying color_quad_i *uniform pLow, cons
 					float pb = (float)pPixels[i].m_c[2];
 					float pa = (float)pPixels[i].m_c[3];
 				
-					float dr0 = weightedColors[0].m_c[0] - pr;
-					float dg0 = weightedColors[0].m_c[1] - pg;
-					float db0 = weightedColors[0].m_c[2] - pb;
-					float da0 = weightedColors[0].m_c[3] - pa;
-					float err0 = wr * dr0 * dr0 + wg * dg0 * dg0 + wb * db0 * db0 + wa * da0 * da0;
+					float best_err;
+					int best_sel;
 
-					float dr1 = weightedColors[1].m_c[0] - pr;
-					float dg1 = weightedColors[1].m_c[1] - pg;
-					float db1 = weightedColors[1].m_c[2] - pb;
-					float da1 = weightedColors[1].m_c[3] - pa;
-					float err1 = wr * dr1 * dr1 + wg * dg1 * dg1 + wb * db1 * db1 + wa * da1 * da1;
+					if (pParams->m_optimize_for_color_times_alpha)
+					{
+						float err0 = evaluate_error_alpha_blend(&weightedColors[0], pr, pg, pb, pa, wr, wg, wb, wa, pParams);
+						float err1 = evaluate_error_alpha_blend(&weightedColors[1], pr, pg, pb, pa, wr, wg, wb, wa, pParams);
+						float err2 = evaluate_error_alpha_blend(&weightedColors[2], pr, pg, pb, pa, wr, wg, wb, wa, pParams);
+						float err3 = evaluate_error_alpha_blend(&weightedColors[3], pr, pg, pb, pa, wr, wg, wb, wa, pParams);
 
-					float dr2 = weightedColors[2].m_c[0] - pr;
-					float dg2 = weightedColors[2].m_c[1] - pg;
-					float db2 = weightedColors[2].m_c[2] - pb;
-					float da2 = weightedColors[2].m_c[3] - pa;
-					float err2 = wr * dr2 * dr2 + wg * dg2 * dg2 + wb * db2 * db2 + wa * da2 * da2;
+						best_err = min(min(min(err0, err1), err2), err3);
+										
+						best_sel = select(best_err == err1, 1, 0);
+						best_sel = select(best_err == err2, 2, best_sel);
+						best_sel = select(best_err == err3, 3, best_sel);
+					}
+					else
+					{
+						float err0 = evaluate_error_orthogonal(&weightedColors[0], pr, pg, pb, pa, wr, wg, wb, wa);
+						float err1 = evaluate_error_orthogonal(&weightedColors[1], pr, pg, pb, pa, wr, wg, wb, wa);
+						float err2 = evaluate_error_orthogonal(&weightedColors[2], pr, pg, pb, pa, wr, wg, wb, wa);
+						float err3 = evaluate_error_orthogonal(&weightedColors[3], pr, pg, pb, pa, wr, wg, wb, wa);
 
-					float dr3 = weightedColors[3].m_c[0] - pr;
-					float dg3 = weightedColors[3].m_c[1] - pg;
-					float db3 = weightedColors[3].m_c[2] - pb;
-					float da3 = weightedColors[3].m_c[3] - pa;
-					float err3 = wr * dr3 * dr3 + wg * dg3 * dg3 + wb * db3 * db3 + wa * da3 * da3;
-
-					float best_err = min(min(min(err0, err1), err2), err3);
-
-					int best_sel = select(best_err == err1, 1, 0);
-					best_sel = select(best_err == err2, 2, best_sel);
-					best_sel = select(best_err == err3, 3, best_sel);
-								
-					total_errf += best_err;
+						best_err = min(min(min(err0, err1), err2), err3);
+										
+						best_sel = select(best_err == err1, 1, 0);
+						best_sel = select(best_err == err2, 2, best_sel);
+						best_sel = select(best_err == err3, 3, best_sel);
+					}
+				
+					total_err += best_err;
 
 					pResults->m_pSelectors_temp[i] = best_sel;
 				}
@@ -1623,21 +2570,112 @@ static uint64_t evaluate_solution(const varying color_quad_i *uniform pLow, cons
 
 		float weightedColorsY[16], weightedColorsCr[16], weightedColorsCb[16];
 		
-		for (uniform uint32_t i = 0; i < N; i++)
+		if (!pParams->m_optimize_for_color_times_alpha || (!pParams->m_has_alpha && pCompAlpha == NULL))
 		{
-			float r = weightedColors[i].m_c[0];
-			float g = weightedColors[i].m_c[1];
-			float b = weightedColors[i].m_c[2];
+			for (uniform uint32_t i = 0; i < N; i++)
+			{
+				const float r = weightedColors[i].m_c[0];
+				const float g = weightedColors[i].m_c[1];
+				const float b = weightedColors[i].m_c[2];
 
-			float y = r * .2126f + g * .7152f + b * .0722f;
+				const float y = r * k_Y_R + g * k_Y_G + b * k_Y_B;
 									
-			weightedColorsY[i] = y;
-			weightedColorsCr[i] = r - y;
-			weightedColorsCb[i] = b - y;
-		}
+				weightedColorsY[i] = y;
+				weightedColorsCr[i] = r - y;
+				weightedColorsCb[i] = b - y;
+			}
 
-		if (pParams->m_has_alpha)
+			if (pParams->m_has_alpha)
+			{
+				for (uniform uint32_t i = 0; i < num_pixels; i++)
+				{
+					const float r = pPixels[i].m_c[0];
+					const float g = pPixels[i].m_c[1];
+					const float b = pPixels[i].m_c[2];
+					const float a = pPixels[i].m_c[3];
+
+					const float y = r * k_Y_R + g * k_Y_G + b * k_Y_B;
+					const float cr = r - y;
+					const float cb = b - y;
+
+					float best_err = FLT_MAX;
+					int32_t best_sel;
+									
+					for (uniform uint32_t j = 0; j < N; j++)
+					{
+						const float dy = y - weightedColorsY[j];
+						const float dcr = cr - weightedColorsCr[j];
+						const float dcb = cb - weightedColorsCb[j];
+						const float da = a - weightedColors[j].m_c[3];
+
+						const float err = (wr * dy * dy) + (wg * dcr * dcr) + (wb * dcb * dcb) + (wa * da * da);
+						if (err < best_err)
+						{
+							best_err = err;
+							best_sel = j;
+						}
+					}
+					
+					total_err += best_err;
+
+					pResults->m_pSelectors_temp[i] = best_sel;
+				}
+			}
+			else
+			{
+				for (uniform uint32_t i = 0; i < num_pixels; i++)
+				{
+					const float r = pPixels[i].m_c[0];
+					const float g = pPixels[i].m_c[1];
+					const float b = pPixels[i].m_c[2];
+
+					const float y = r * k_Y_R + g * k_Y_G + b * k_Y_B;
+					const float cr = r - y;
+					const float cb = b - y;
+
+					float best_err = FLT_MAX;
+					int32_t best_sel;
+								
+					for (uniform uint32_t j = 0; j < N; j++)
+					{
+						const float dy = y - weightedColorsY[j];
+						const float dcr = cr - weightedColorsCr[j];
+						const float dcb = cb - weightedColorsCb[j];
+
+						const float err = (wr * dy * dy) + (wg * dcr * dcr) + (wb * dcb * dcb);
+						if (err < best_err)
+						{
+							best_err = err;
+							best_sel = j;
+						}
+					}
+				
+					total_err += best_err;
+
+					pResults->m_pSelectors_temp[i] = best_sel;
+				}
+			}
+		}
+		else if (pParams->m_has_alpha)
 		{
+			// As an optimization, the loop to find the best palette entry just minimizes |D|^2 + da^2. We just need to pick the
+			// palette entry that minimizes peak error; this should track well with that, and is much cheaper to calculate than
+			// the actual error. We do the expensive check for the actual error at the end so that we can compare candidate blocks
+			// fairly.
+			for (uniform uint32_t i = 0; i < N; i++)
+			{
+				float r = weightedColors[i].m_c[0];
+				float g = weightedColors[i].m_c[1];
+				float b = weightedColors[i].m_c[2];
+				float a = weightedColors[i].m_c[3];
+
+				float y = r * k_Y_R + g * k_Y_G + b * k_Y_B;
+									
+				weightedColorsY[i] = y * a;
+				weightedColorsCr[i] = (r - y) * a;
+				weightedColorsCb[i] = (b - y) * a;
+			}
+
 			for (uniform uint32_t i = 0; i < num_pixels; i++)
 			{
 				float r = pPixels[i].m_c[0];
@@ -1645,70 +2683,256 @@ static uint64_t evaluate_solution(const varying color_quad_i *uniform pLow, cons
 				float b = pPixels[i].m_c[2];
 				float a = pPixels[i].m_c[3];
 
-				float y = r * .2126f + g * .7152f + b * .0722f;
+				float y = r * k_Y_R + g * k_Y_G + b * k_Y_B;
 				float cr = r - y;
 				float cb = b - y;
+				float y_a = y * a;
+				float cr_a = cr * a;
+				float cb_a = cb * a;
 
-				float best_err = 1e+10f;
+				// The worst case dy, dcr, dcb for a candidate is 255 * 255 (~2^16). This gets squared (~2^32). There are 16 pixels (~2^36).
+				// So, we need to initialize this to a really big number; 10 billion is approximately 2^33 which is not enough.
+				float best_err = FLT_MAX;
+				uniform const bool doPrints = false;//pParams->m_debug_spam;
 				int32_t best_sel;
-								
+				float best_da;
+				vec3F D;
+				if (doPrints)
+				{
+					print("consts:\n");
+					print("  wr % wg % wb % wa %\n", wr, wg, wb, wa);
+					print("  has_alpha %\n", pParams->m_has_alpha);
+					print("pixel:\n");
+					print("  R %\n", r);
+					print("  G %\n", g);
+					print("  B %\n", b);
+					print("  A %\n", a);
+					print("  Y %\n", y);
+					print("  Cr %\n", cr);
+					print("  Cb %\n", cb);
+					print("  Y_a %\n", y_a);
+					print("  Cr_a %\n", cr_a);
+					print("  Cb_a %\n", cb_a);
+				}
+
 				for (uniform uint32_t j = 0; j < N; j++)
 				{
-					float dl = y - weightedColorsY[j];
-					float dcr = cr - weightedColorsCr[j];
-					float dcb = cb - weightedColorsCb[j];
+					float dy = y_a - weightedColorsY[j];
+					float dcr = cr_a - weightedColorsCr[j];
+					float dcb = cb_a - weightedColorsCb[j];
 					float da = a - weightedColors[j].m_c[3];
 
-					float err = (wr * dl * dl) + (wg * dcr * dcr) + (wb * dcb * dcb) + (wa * da * da);
+					float err = (wr * dy * dy) + (wg * dcr * dcr) + (wb * dcb * dcb) + (wa * da * da);
+					if (doPrints)
+					{
+						print("index %:\n", j);
+						print("  R %\n", weightedColors[j].m_c[0]);
+						print("  G %\n", weightedColors[j].m_c[1]);
+						print("  B %\n", weightedColors[j].m_c[2]);
+						print("  A %\n", weightedColors[j].m_c[3]);
+						print("  Y %\n", weightedColorsY[j]);
+						print("  Cr %\n", weightedColorsCr[j]);
+						print("  Cb %\n", weightedColorsCb[j]);
+						print("  dy %\n", dy);
+						print("  dcr %\n", dcr);
+						print("  dcb %\n", dcb);
+						print("  da %\n", da);
+						print("  err %\n", err);
+					}
 					if (err < best_err)
 					{
 						best_err = err;
 						best_sel = j;
+						D.m_c[0] = dy;
+						D.m_c[1] = dcr;
+						D.m_c[2] = dcb;
+						best_da = da;
 					}
 				}
-				
-				total_errf += best_err;
+
+				// now calculate actual error
+				vec3F mid = vec3F_mul(&D, &pParams->m_sqrt_weights);
+				mid.m_c[0] += best_da * pParams->m_dycrcb_mid;
+
+				vec3F delta_r = vec3F_mul(&pParams->m_dycrcb_r, copysign(best_da, vec3F_dot(&pParams->m_dycrcb_r, &mid)));
+				vec3F delta_g = vec3F_mul(&pParams->m_dycrcb_g, copysign(best_da, vec3F_dot(&pParams->m_dycrcb_g, &mid)));
+				vec3F delta_b = vec3F_mul(&pParams->m_dycrcb_b, copysign(best_da, vec3F_dot(&pParams->m_dycrcb_b, &mid)));
+
+				vec3F corner = mid;
+				vec3F_accum(&corner, &delta_r);
+				vec3F_accum(&corner, &delta_g);
+				vec3F_accum(&corner, &delta_b);
+
+				const float actual_err = vec3F_dot(&corner, &corner) * (1.0f / (255.0f * 255.0f));
+				if (doPrints)
+					print("actual err %\n", actual_err);
+				total_err += actual_err;
 
 				pResults->m_pSelectors_temp[i] = best_sel;
+				assert(best_sel < pParams->m_num_selector_weights);
 			}
 		}
 		else
 		{
-			for (uniform uint32_t i = 0; i < num_pixels; i++)
+			assert(pCompAlpha);
+			assert(optimizeForColorTimesAlpha_SeparateAlpha);
+
+			// As an optimization, the loop to find the best palette entry just minimizes |D|^2 + da^2. We just need to pick the
+			// palette entry that minimizes peak error; this should track well with that, and is much cheaper to calculate than
+			// the actual error. We do the expensive check for the actual error at the end so that we can compare candidate blocks
+			// fairly.
+			if (pParams->m_rotation == 0)
 			{
-				float r = pPixels[i].m_c[0];
-				float g = pPixels[i].m_c[1];
-				float b = pPixels[i].m_c[2];
-
-				float y = r * .2126f + g * .7152f + b * .0722f;
-				float cr = r - y;
-				float cb = b - y;
-
-				float best_err = 1e+10f;
-				int32_t best_sel;
-								
-				for (uniform uint32_t j = 0; j < N; j++)
+				for (uniform uint32_t i = 0; i < N; i++)
 				{
-					float dl = y - weightedColorsY[j];
-					float dcr = cr - weightedColorsCr[j];
-					float dcb = cb - weightedColorsCb[j];
+					float r = weightedColors[i].m_c[0];
+					float g = weightedColors[i].m_c[1];
+					float b = weightedColors[i].m_c[2];
 
-					float err = (wr * dl * dl) + (wg * dcr * dcr) + (wb * dcb * dcb);
-					if (err < best_err)
-					{
-						best_err = err;
-						best_sel = j;
-					}
+					float y = r * k_Y_R + g * k_Y_G + b * k_Y_B;
+									
+					weightedColorsY[i] = y;
+					weightedColorsCr[i] = r - y;
+					weightedColorsCb[i] = b - y;
 				}
-				
-				total_errf += best_err;
 
-				pResults->m_pSelectors_temp[i] = best_sel;
+				for (uniform uint32_t i = 0; i < num_pixels; i++)
+				{
+					float r = pPixels[i].m_c[0];
+					float g = pPixels[i].m_c[1];
+					float b = pPixels[i].m_c[2];
+					float a = pPixels[i].m_c[3];
+
+					float y = r * k_Y_R + g * k_Y_G + b * k_Y_B;
+					float cr = r - y;
+					float cb = b - y;
+					float y_a = y * a;
+					float cr_a = cr * a;
+					float cb_a = cb * a;
+
+					// The worst case dy, dcr, dcb for a candidate is 255 * 255 (~2^16). This gets squared (~2^32). There are 16 pixels (~2^36).
+					// So, we need to initialize this to a really big number; 10 billion is approximately 2^33 which is not enough.
+					float best_err = FLT_MAX;
+					int32_t best_sel;
+					float best_da;
+					vec3F D;
+
+					const float sep_a = pCompAlpha[i];
+					for (uniform uint32_t j = 0; j < N; j++)
+					{
+						float dy = y_a - weightedColorsY[j] * sep_a;
+						float dcr = cr_a - weightedColorsCr[j] * sep_a;
+						float dcb = cb_a - weightedColorsCb[j] * sep_a;
+						float da = a - sep_a;
+
+						float err = (wr * dy * dy) + (wg * dcr * dcr) + (wb * dcb * dcb) + (wa * da * da);
+						if (err < best_err)
+						{
+							best_err = err;
+							best_sel = j;
+							D.m_c[0] = dy;
+							D.m_c[1] = dcr;
+							D.m_c[2] = dcb;
+							best_da = da;
+						}
+					}
+
+					// now calculate actual error
+					vec3F mid = vec3F_mul(&D, &pParams->m_sqrt_weights);
+					mid.m_c[0] += best_da * pParams->m_dycrcb_mid;
+
+					vec3F delta_r = vec3F_mul(&pParams->m_dycrcb_r, copysign(best_da, vec3F_dot(&pParams->m_dycrcb_r, &mid)));
+					vec3F delta_g = vec3F_mul(&pParams->m_dycrcb_g, copysign(best_da, vec3F_dot(&pParams->m_dycrcb_g, &mid)));
+					vec3F delta_b = vec3F_mul(&pParams->m_dycrcb_b, copysign(best_da, vec3F_dot(&pParams->m_dycrcb_b, &mid)));
+
+					vec3F corner = mid;
+					vec3F_accum(&corner, &delta_r);
+					vec3F_accum(&corner, &delta_g);
+					vec3F_accum(&corner, &delta_b);
+
+					total_err += vec3F_dot(&corner, &corner) * (1.0f / (255.0f * 255.0f));
+
+					pResults->m_pSelectors_temp[i] = best_sel;
+					assert(best_sel < pParams->m_num_selector_weights);
+				}
+			}
+			else
+			{
+				uniform const uint32_t chan_r = (pParams->m_rotation == 1) ? 3 : 0;
+				uniform const uint32_t chan_g = (pParams->m_rotation == 2) ? 3 : 1;
+				uniform const uint32_t chan_b = (pParams->m_rotation == 3) ? 3 : 2;
+				uniform const uint32_t chan_a = pParams->m_rotation - 1;
+				for (uniform uint32_t i = 0; i < num_pixels; i++)
+				{
+					const float r = pPixels[i].m_c[chan_r];
+					const float g = pPixels[i].m_c[chan_g];
+					const float b = pPixels[i].m_c[chan_b];
+					const float a = pPixels[i].m_c[chan_a];
+
+					const float y = r * k_Y_R + g * k_Y_G + b * k_Y_B;
+					const float cr = r - y;
+					const float cb = b - y;
+					const float y_a = y * a;
+					const float cr_a = cr * a;
+					const float cb_a = cb * a;
+
+					// The worst case dy, dcr, dcb for a candidate is 255 * 255 (~2^16). This gets squared (~2^32). There are 16 pixels (~2^36).
+					// So, we need to initialize this to a really big number; 10 billion is approximately 2^33 which is not enough.
+					float best_err = FLT_MAX;
+					int32_t best_sel;
+					float best_da;
+					vec3F D;
+
+					const float sep_a = pCompAlpha[i];
+					for (uniform uint32_t j = 0; j < N; j++)
+					{
+						const float pal_r = (pParams->m_rotation == 1) ? pCompAlpha[i] : weightedColors[j].m_c[0];
+						const float pal_g = (pParams->m_rotation == 2) ? pCompAlpha[i] : weightedColors[j].m_c[1];
+						const float pal_b = (pParams->m_rotation == 3) ? pCompAlpha[i] : weightedColors[j].m_c[2];
+						const float pal_a = weightedColors[j].m_c[pParams->m_rotation - 1];
+
+						const float pal_y = pal_r * k_Y_R + pal_g * k_Y_G + pal_b * k_Y_B;
+						const float pal_cr = pal_r - pal_y;
+						const float pal_cb = pal_b - pal_y;
+
+						const float dy = y_a - pal_y * pal_a;
+						const float dcr = cr_a - pal_cr * pal_a;
+						const float dcb = cb_a - pal_cb * pal_a;
+						const float da = a - pal_a;
+
+						const float err = (wr * dy * dy) + (wg * dcr * dcr) + (wb * dcb * dcb) + (wa * da * da);
+						if (err < best_err)
+						{
+							best_err = err;
+							best_sel = j;
+							D.m_c[0] = dy;
+							D.m_c[1] = dcr;
+							D.m_c[2] = dcb;
+							best_da = da;
+						}
+					}
+
+					// now calculate actual error
+					vec3F mid = vec3F_mul(&D, &pParams->m_sqrt_weights);
+					mid.m_c[0] += best_da * pParams->m_dycrcb_mid;
+
+					vec3F delta_r = vec3F_mul(&pParams->m_dycrcb_r, copysign(best_da, vec3F_dot(&pParams->m_dycrcb_r, &mid)));
+					vec3F delta_g = vec3F_mul(&pParams->m_dycrcb_g, copysign(best_da, vec3F_dot(&pParams->m_dycrcb_g, &mid)));
+					vec3F delta_b = vec3F_mul(&pParams->m_dycrcb_b, copysign(best_da, vec3F_dot(&pParams->m_dycrcb_b, &mid)));
+
+					vec3F corner = mid;
+					vec3F_accum(&corner, &delta_r);
+					vec3F_accum(&corner, &delta_g);
+					vec3F_accum(&corner, &delta_b);
+
+					total_err += vec3F_dot(&corner, &corner) * (1.0f / (255.0f * 255.0f));
+
+					pResults->m_pSelectors_temp[i] = best_sel;
+					assert(best_sel < pParams->m_num_selector_weights);
+				}
 			}
 		}
 	}
-
-	uint64_t total_err = (int64)total_errf;
 
 	if (total_err < pResults->m_best_overall_err)
 	{
@@ -1721,7 +2945,10 @@ static uint64_t evaluate_solution(const varying color_quad_i *uniform pLow, cons
 		pResults->m_pbits[1] = pbits[1];
 
 		for (uniform uint32_t i = 0; i < num_pixels; i++)
+		{
 			pResults->m_pSelectors[i] = pResults->m_pSelectors_temp[i];
+			assert(pResults->m_pSelectors[i] < pParams->m_num_selector_weights);
+		}
 	}
 				
 	return total_err;
@@ -1731,7 +2958,7 @@ static void fixDegenerateEndpoints(uniform uint32_t mode, varying color_quad_i *
 {
 	if ((mode == 1) || (mode == 4)) // also mode 2
 	{
-		// fix degenerate case where the input collapses to a single colorspace voxel, and we loose all freedom (test with grayscale ramps)
+		// fix degenerate case where the input collapses to a single colorspace voxel, and we lose all freedom (test with grayscale ramps)
 		for (uniform uint32_t i = 0; i < 3; i++)
 		{
 			if (pTrialMinColor->m_c[i] == pTrialMaxColor->m_c[i])
@@ -1777,8 +3004,8 @@ static void fixDegenerateEndpoints(uniform uint32_t mode, varying color_quad_i *
 	}
 }
 
-static uint64_t find_optimal_solution(uniform uint32_t mode, varying vec4F *uniform pXl, varying vec4F *uniform pXh, const uniform color_cell_compressor_params *uniform pParams, varying color_cell_compressor_results *uniform pResults, 
-	uniform bool pbit_search, uint32_t num_pixels, const varying color_quad_i *uniform pPixels)
+static float find_optimal_solution(uniform uint32_t mode, varying vec4F *uniform pXl, varying vec4F *uniform pXh, const uniform color_cell_compressor_params *uniform pParams, varying color_cell_compressor_results *uniform pResults, 
+	uniform bool pbit_search, uint32_t num_pixels, const varying color_quad_i *uniform pPixels, const varying int32_t *uniform pCompAlpha)
 {
 	vec4F xl = *pXl;
 	vec4F xh = *pXh;
@@ -1788,220 +3015,174 @@ static uint64_t find_optimal_solution(uniform uint32_t mode, varying vec4F *unif
 		
 	if (pParams->m_has_pbits)
 	{
+		// Notes: The pbit controls which quantization intervals are selected.
+		// total_levels=2^(comp_bits+1), where comp_bits=4 for mode 0, etc.
+		// pbit 0: v=(b*2)/(total_levels-1), pbit 1: v=(b*2+1)/(total_levels-1) where b is the component bin from [0,total_levels/2-1] and v is the [0,1] component value
+		// rearranging you get for pbit 0: b=round((v*(total_levels-1)-0)/2)
+		// rearranging you get for pbit 1: b=round((v*(total_levels-1)-1)/2)
+		// let N = total_levels - 1: b = (int)round((v * N - p) * 0.5)
+		// v is clamped to be in [0,1], so "v * N - p" is in the range [-p,N-p]. When halved, this is [-p/2, (N-p)/2].
+		// The valid range for b is [0, (N-1)/2], so b can be too small when p is 1 or too large when p is 0, so we just need to clamp.
+		//   b = (int)round(clamp((v * N - p) * 0.5, 0, (N - 1) * 0.5)
+		// We can also precalculate constants:
+		//   b = (int)round(clamp(v * (N * 0.5) - (p * 0.5), 0, (N * 0.5 - 0.5)))
+
+		const uniform int total_comp_bits = pParams->m_comp_bits + 1;
+		const uniform int iscalep = (1 << total_comp_bits) - 1;
+		const uniform float scalep = (float)iscalep;
+		const uniform float half_N = scalep * 0.5f;
+		const uniform float upper = half_N - 0.5f;
+
+		const uniform int32_t totalComps = pParams->m_has_alpha ? 4 : 3;
+
+		const uniform bool force_pbits_to_1 = (mode == 6 && !pParams->m_has_alpha);	// If we have an opaque block in mode 6, we need pbits 1 to keep alpha 255 instead of 254
+
 		if (pbit_search)
 		{
 			// compensated rounding+pbit search
-			const uniform int iscalep = (1 << (pParams->m_comp_bits + 1)) - 1;
-			const uniform float scalep = (float)iscalep;
-
-			const uniform int32_t totalComps = pParams->m_has_alpha ? 4 : 3;
-
-			if (!pParams->m_endpoints_share_pbit)
-			{
-				color_quad_i lo[2], hi[2];
+			color_quad_i lo[2], hi[2];
 								
-				for (uniform int p = 0; p < 2; p++)
+			for (uniform int p = 0; p < 2; p++)
+			{
+				const uniform float half_p = p * 0.5f;
+				for (uniform uint32_t c = 0; c < 4; c++)
 				{
-					color_quad_i xMinColor, xMaxColor;
-
-					// Notes: The pbit controls which quantization intervals are selected.
-					// total_levels=2^(comp_bits+1), where comp_bits=4 for mode 0, etc.
-					// pbit 0: v=(b*2)/(total_levels-1), pbit 1: v=(b*2+1)/(total_levels-1) where b is the component bin from [0,total_levels/2-1] and v is the [0,1] component value
-					// rearranging you get for pbit 0: b=floor(v*(total_levels-1)/2+.5)
-					// rearranging you get for pbit 1: b=floor((v*(total_levels-1)-1)/2+.5)
-					for (uniform uint32_t c = 0; c < 4; c++)
-					{
-						xMinColor.m_c[c] = (int)((xl.m_c[c] * scalep - p) / 2.0f + .5f) * 2 + p;
-						xMinColor.m_c[c] = clamp(xMinColor.m_c[c], p, iscalep - 1 + p);
-
-						xMaxColor.m_c[c] = (int)((xh.m_c[c] * scalep - p) / 2.0f + .5f) * 2 + p;
-						xMaxColor.m_c[c] = clamp(xMaxColor.m_c[c], p, iscalep - 1 + p);
-					}
-																				
-					lo[p] = xMinColor;
-					hi[p] = xMaxColor;
-
-					for (uniform int c = 0; c < 4; c++)
-					{
-						lo[p].m_c[c] >>= 1;
-						hi[p].m_c[c] >>= 1;
-					}
+					lo[p].m_c[c] = (int)round(clamp(xl.m_c[c] * half_N - half_p, 0.0f, upper));
+					hi[p].m_c[c] = (int)round(clamp(xh.m_c[c] * half_N - half_p, 0.0f, upper));
 				}
-
-				fixDegenerateEndpoints(mode, &lo[0], &hi[0], &xl, &xh, iscalep >> 1);
-				fixDegenerateEndpoints(mode, &lo[1], &hi[1], &xl, &xh, iscalep >> 1);
-
-				uint32_t pbits[2];
-				
-				pbits[0] = 0; pbits[1] = 0;
-				evaluate_solution(&lo[0], &hi[0], pbits, pParams, pResults, num_pixels, pPixels);
-
-				pbits[0] = 0; pbits[1] = 1;
-				evaluate_solution(&lo[0], &hi[1], pbits, pParams, pResults, num_pixels, pPixels);
-
-				pbits[0] = 1; pbits[1] = 0;
-				evaluate_solution(&lo[1], &hi[0], pbits, pParams, pResults, num_pixels, pPixels);
-				
-				pbits[0] = 1; pbits[1] = 1;
-				evaluate_solution(&lo[1], &hi[1], pbits, pParams, pResults, num_pixels, pPixels);
 			}
-			else
+
+			fixDegenerateEndpoints(mode, &lo[0], &hi[0], &xl, &xh, iscalep >> 1);
+			fixDegenerateEndpoints(mode, &lo[1], &hi[1], &xl, &xh, iscalep >> 1);
+
+			uint32_t pbits[2];
+
+			// shared pbits
+			pbits[0] = 1; pbits[1] = 1;
+			evaluate_solution(&lo[1], &hi[1], pbits, pParams, pResults, num_pixels, pPixels, pCompAlpha);
+
+			if (!force_pbits_to_1)
 			{
-				// Endpoints share pbits
-				color_quad_i lo[2], hi[2];
-
-				for (uniform int p = 0; p < 2; p++)
-				{
-					color_quad_i xMinColor, xMaxColor;
-								
-					for (uniform uint32_t c = 0; c < 4; c++)
-					{
-						xMinColor.m_c[c] = (int)((xl.m_c[c] * scalep - p) / 2.0f + .5f) * 2 + p;
-						xMinColor.m_c[c] = clamp(xMinColor.m_c[c], p, iscalep - 1 + p);
-
-						xMaxColor.m_c[c] = (int)((xh.m_c[c] * scalep - p) / 2.0f + .5f) * 2 + p;
-						xMaxColor.m_c[c] = clamp(xMaxColor.m_c[c], p, iscalep - 1 + p);
-					}
-										
-					lo[p] = xMinColor;
-					hi[p] = xMaxColor;
-
-					for (uniform int c = 0; c < 4; c++)
-					{
-						lo[p].m_c[c] >>= 1;
-						hi[p].m_c[c] >>= 1;
-					}
-				}
-
-				fixDegenerateEndpoints(mode, &lo[0], &hi[0], &xl, &xh, iscalep >> 1);
-				fixDegenerateEndpoints(mode, &lo[1], &hi[1], &xl, &xh, iscalep >> 1);
-				
-				uint32_t pbits[2];
-				
 				pbits[0] = 0; pbits[1] = 0;
-				evaluate_solution(&lo[0], &hi[0], pbits, pParams, pResults, num_pixels, pPixels);
+				evaluate_solution(&lo[0], &hi[0], pbits, pParams, pResults, num_pixels, pPixels, pCompAlpha);
 
-				pbits[0] = 1; pbits[1] = 1;
-				evaluate_solution(&lo[1], &hi[1], pbits, pParams, pResults, num_pixels, pPixels);
+				if (!pParams->m_endpoints_share_pbit)
+				{
+					// different pbits
+					pbits[0] = 0; pbits[1] = 1;
+					evaluate_solution(&lo[0], &hi[1], pbits, pParams, pResults, num_pixels, pPixels, pCompAlpha);
+
+					pbits[0] = 1; pbits[1] = 0;
+					evaluate_solution(&lo[1], &hi[0], pbits, pParams, pResults, num_pixels, pPixels, pCompAlpha);
+				}
 			}
 		}
 		else
 		{
 			// compensated rounding
-			const uniform int iscalep = (1 << (pParams->m_comp_bits + 1)) - 1;
-			const uniform float scalep = (float)iscalep;
-
-			const uniform int32_t totalComps = pParams->m_has_alpha ? 4 : 3;
-
 			uint32_t best_pbits[2];
 			color_quad_i bestMinColor, bestMaxColor;
-						
+
+			const uniform int left_shift = 8 - total_comp_bits;
+			const uniform int right_shift = total_comp_bits * 2 - 8;
+			const uniform int min_p = force_pbits_to_1 ? 1 : 0;
 			if (!pParams->m_endpoints_share_pbit)
 			{
-				float best_err0 = 1e+9;
-				float best_err1 = 1e+9;
+				float best_err0 = FLT_MAX;
+				float best_err1 = FLT_MAX;
 								
-				for (uniform int p = 0; p < 2; p++)
+				for (uniform int p = min_p; p < 2; p++)
 				{
 					color_quad_i xMinColor, xMaxColor;
 
-					// Notes: The pbit controls which quantization intervals are selected.
-					// total_levels=2^(comp_bits+1), where comp_bits=4 for mode 0, etc.
-					// pbit 0: v=(b*2)/(total_levels-1), pbit 1: v=(b*2+1)/(total_levels-1) where b is the component bin from [0,total_levels/2-1] and v is the [0,1] component value
-					// rearranging you get for pbit 0: b=floor(v*(total_levels-1)/2+.5)
-					// rearranging you get for pbit 1: b=floor((v*(total_levels-1)-1)/2+.5)
-					for (uniform uint32_t c = 0; c < 4; c++)
+					const uniform float half_p = p * 0.5f;
+					float err0 = 0.0f;
+					float err1 = 0.0f;
+					for (uniform uint32_t c = 0; c < totalComps; c++)
 					{
-						xMinColor.m_c[c] = (int)((xl.m_c[c] * scalep - p) / 2.0f + .5f) * 2 + p;
-						xMinColor.m_c[c] = clamp(xMinColor.m_c[c], p, iscalep - 1 + p);
+						const int lo = (int)round(clamp(xl.m_c[c] * half_N - half_p, 0.0f, upper));
+						const int hi = (int)round(clamp(xh.m_c[c] * half_N - half_p, 0.0f, upper));
+						xMinColor.m_c[c] = lo;
+						xMaxColor.m_c[c] = hi;
 
-						xMaxColor.m_c[c] = (int)((xh.m_c[c] * scalep - p) / 2.0f + .5f) * 2 + p;
-						xMaxColor.m_c[c] = clamp(xMaxColor.m_c[c], p, iscalep - 1 + p);
+						const int lo_with_p = lo * 2 + p;
+						const int hi_with_p = hi * 2 + p;
+
+						const int lo_decoded = (lo_with_p << left_shift) | (lo_with_p >> right_shift);
+						const int hi_decoded = (hi_with_p << left_shift) | (hi_with_p >> right_shift);
+						assert(lo_decoded <= 255);
+						assert(hi_decoded <= 255);
+
+						err0 += square(lo_decoded - xl.m_c[c] * 255.0f);
+						err1 += square(hi_decoded - xh.m_c[c] * 255.0f);
 					}
-																				
-					color_quad_i scaledLow = scale_color(&xMinColor, pParams);
-					color_quad_i scaledHigh = scale_color(&xMaxColor, pParams);
-
-					float err0 = 0;
-					float err1 = 0;
-					for (uniform int i = 0; i < totalComps; i++)
+					if (!pParams->m_has_alpha)
 					{
-						err0 += square(scaledLow.m_c[i] - xl.m_c[i]*255.0f);
-						err1 += square(scaledHigh.m_c[i] - xh.m_c[i]*255.0f);
+						xMinColor.m_c[3] = (int)round(clamp(xl.m_c[3] * half_N - half_p, 0.0f, upper));
+						xMaxColor.m_c[3] = (int)round(clamp(xh.m_c[3] * half_N - half_p, 0.0f, upper));
 					}
 
 					if (err0 < best_err0)
 					{
 						best_err0 = err0;
 						best_pbits[0] = p;
-						
-						bestMinColor.m_c[0] = xMinColor.m_c[0] >> 1;
-						bestMinColor.m_c[1] = xMinColor.m_c[1] >> 1;
-						bestMinColor.m_c[2] = xMinColor.m_c[2] >> 1;
-						bestMinColor.m_c[3] = xMinColor.m_c[3] >> 1;
+						bestMinColor = xMinColor;
 					}
 
 					if (err1 < best_err1)
 					{
 						best_err1 = err1;
 						best_pbits[1] = p;
-
-						bestMaxColor.m_c[0] = xMaxColor.m_c[0] >> 1;
-						bestMaxColor.m_c[1] = xMaxColor.m_c[1] >> 1;
-						bestMaxColor.m_c[2] = xMaxColor.m_c[2] >> 1;
-						bestMaxColor.m_c[3] = xMaxColor.m_c[3] >> 1;
+						bestMaxColor = xMaxColor;
 					}
 				}
 			}
 			else
 			{
 				// Endpoints share pbits
-				float best_err = 1e+9;
-
-				for (uniform int p = 0; p < 2; p++)
+				float best_err = FLT_MAX;
+								
+				for (uniform int p = min_p; p < 2; p++)
 				{
 					color_quad_i xMinColor, xMaxColor;
-								
-					for (uniform uint32_t c = 0; c < 4; c++)
+
+					const float half_p = p * 0.5f;
+					float err = 0.0f;
+					for (uniform uint32_t c = 0; c < totalComps; c++)
 					{
-						xMinColor.m_c[c] = (int)((xl.m_c[c] * scalep - p) / 2.0f + .5f) * 2 + p;
-						xMinColor.m_c[c] = clamp(xMinColor.m_c[c], p, iscalep - 1 + p);
+						const int lo = (int)round(clamp(xl.m_c[c] * half_N - half_p, 0.0f, upper));
+						const int hi = (int)round(clamp(xh.m_c[c] * half_N - half_p, 0.0f, upper));
+						xMinColor.m_c[c] = lo;
+						xMaxColor.m_c[c] = hi;
 
-						xMaxColor.m_c[c] = (int)((xh.m_c[c] * scalep - p) / 2.0f + .5f) * 2 + p;
-						xMaxColor.m_c[c] = clamp(xMaxColor.m_c[c], p, iscalep - 1 + p);
+						const int lo_with_p = lo * 2 + p;
+						const int hi_with_p = hi * 2 + p;
+
+						const int lo_decoded = (lo_with_p << left_shift) | (lo_with_p >> right_shift);
+						const int hi_decoded = (hi_with_p << left_shift) | (hi_with_p >> right_shift);
+						assert(lo_decoded <= 255);
+						assert(hi_decoded <= 255);
+
+						err += square(lo_decoded - xl.m_c[c] * 255.0f);
+						err += square(hi_decoded - xh.m_c[c] * 255.0f);
 					}
-										
-					color_quad_i scaledLow = scale_color(&xMinColor, pParams);
-					color_quad_i scaledHigh = scale_color(&xMaxColor, pParams);
-
-					float err = 0;
-					for (uniform int i = 0; i < totalComps; i++)
-						err += square((scaledLow.m_c[i]/255.0f) - xl.m_c[i]) + square((scaledHigh.m_c[i]/255.0f) - xh.m_c[i]);
 
 					if (err < best_err)
 					{
 						best_err = err;
 						best_pbits[0] = p;
 						best_pbits[1] = p;
-						
-						bestMinColor.m_c[0] = xMinColor.m_c[0] >> 1;
-						bestMinColor.m_c[1] = xMinColor.m_c[1] >> 1;
-						bestMinColor.m_c[2] = xMinColor.m_c[2] >> 1;
-						bestMinColor.m_c[3] = xMinColor.m_c[3] >> 1;
-
-						bestMaxColor.m_c[0] = xMaxColor.m_c[0] >> 1;
-						bestMaxColor.m_c[1] = xMaxColor.m_c[1] >> 1;
-						bestMaxColor.m_c[2] = xMaxColor.m_c[2] >> 1;
-						bestMaxColor.m_c[3] = xMaxColor.m_c[3] >> 1;
+						bestMinColor = xMinColor;
+						bestMaxColor = xMaxColor;
 					}
 				}
 			}
 
 			fixDegenerateEndpoints(mode, &bestMinColor, &bestMaxColor, &xl, &xh, iscalep >> 1);
 
-			if ((pResults->m_best_overall_err == UINT64_MAX) || color_quad_i_notequals(&bestMinColor, &pResults->m_low_endpoint) || color_quad_i_notequals(&bestMaxColor, &pResults->m_high_endpoint) || (best_pbits[0] != pResults->m_pbits[0]) || (best_pbits[1] != pResults->m_pbits[1]))
+			if ((pResults->m_best_overall_err == FLT_MAX) || color_quad_i_notequals(&bestMinColor, &pResults->m_low_endpoint) || color_quad_i_notequals(&bestMaxColor, &pResults->m_high_endpoint) || (best_pbits[0] != pResults->m_pbits[0]) || (best_pbits[1] != pResults->m_pbits[1]))
 			{
-				evaluate_solution(&bestMinColor, &bestMaxColor, best_pbits, pParams, pResults, num_pixels, pPixels);
+				evaluate_solution(&bestMinColor, &bestMaxColor, best_pbits, pParams, pResults, num_pixels, pPixels, pCompAlpha);
 			}
 		}
 	}
@@ -2016,13 +3197,13 @@ static uint64_t find_optimal_solution(uniform uint32_t mode, varying vec4F *unif
 
 		fixDegenerateEndpoints(mode, &trialMinColor, &trialMaxColor, &xl, &xh, iscale);
 
-		if ((pResults->m_best_overall_err == UINT64_MAX) || color_quad_i_notequals(&trialMinColor, &pResults->m_low_endpoint) || color_quad_i_notequals(&trialMaxColor, &pResults->m_high_endpoint))
+		if ((pResults->m_best_overall_err == FLT_MAX) || color_quad_i_notequals(&trialMinColor, &pResults->m_low_endpoint) || color_quad_i_notequals(&trialMaxColor, &pResults->m_high_endpoint))
 		{
 			uint32_t pbits[2];
 			pbits[0] = 0;
 			pbits[1] = 0;
 
-			evaluate_solution(&trialMinColor, &trialMaxColor, pbits, pParams, pResults, num_pixels, pPixels);
+			evaluate_solution(&trialMinColor, &trialMaxColor, pbits, pParams, pResults, num_pixels, pPixels, pCompAlpha);
 		}
 	}
 
@@ -2030,15 +3211,16 @@ static uint64_t find_optimal_solution(uniform uint32_t mode, varying vec4F *unif
 }
 
 // Note: In mode 6, m_has_alpha will only be true for transparent blocks.
-static uint64_t color_cell_compression(uniform uint32_t mode, const uniform color_cell_compressor_params *uniform pParams, varying color_cell_compressor_results *uniform pResults, 
-	const uniform bc7e_compress_block_params *uniform pComp_params, uint32_t num_pixels, const varying color_quad_i *uniform pPixels, uniform bool refinement)
+static float color_cell_compression(uniform uint32_t mode, const uniform color_cell_compressor_params *uniform pParams, varying color_cell_compressor_results *uniform pResults, 
+	const uniform bc7e_compress_block_params *uniform pComp_params, uint32_t num_pixels, const varying color_quad_i *uniform pPixels, const varying int32_t *uniform pCompAlpha, uniform bool refinement)
 {
-	pResults->m_best_overall_err = UINT64_MAX;
+	pResults->m_best_overall_err = FLT_MAX;
 
 	if ((mode != 6) && (mode != 7))
-	{
 		assert(!pParams->m_has_alpha);
-	}
+
+	if ((mode != 4) && (mode != 5))
+		assert(pCompAlpha == NULL);
 
 	if ((mode <= 2) || (mode == 4) || (mode >= 6))
 	{
@@ -2068,7 +3250,7 @@ static uint64_t color_cell_compression(uniform uint32_t mode, const uniform colo
 			else if (mode == 7)
 				return pack_mode7_to_one_color(pParams, pResults, cr, cg, cb, ca, pResults->m_pSelectors, num_pixels, pPixels);
 			else
-				return pack_mode24_to_one_color(pParams, pResults, cr, cg, cb, pResults->m_pSelectors, num_pixels, pPixels);
+				return pack_mode24_to_one_color(pParams, pResults, cr, cg, cb, pResults->m_pSelectors, num_pixels, pPixels, pCompAlpha);
 		}
 	}
 
@@ -2184,30 +3366,30 @@ static uint64_t color_cell_compression(uniform uint32_t mode, const uniform colo
 	cif (vec4F_dot(&axis, &axis) < .5f)
 	{
 		if (pParams->m_perceptual)
-			vec4F_set(&axis, .213f, .715f, .072f, pParams->m_has_alpha ? .715f : 0);
+			vec4F_set(&axis, k_Y_R, k_Y_G, k_Y_B, pParams->m_has_alpha ? .715f : 0);
 		else
 			vec4F_set(&axis, 1.0f, 1.0f, 1.0f, pParams->m_has_alpha ? 1.0f : 0);
 		vec4F_normalize_in_place(&axis);
 	}
 
-	float l = 1e+9f, h = -1e+9f;
+	float lo = FLT_MAX, hi = -FLT_MAX;
 
 	cfor (uniform uint32_t i = 0; i < num_pixels; i++)
 	{
-		vec4F color = vec4F_from_color(&pPixels[i]);
+		const vec4F color = vec4F_from_color(&pPixels[i]);
 
-		vec4F q = vec4F_sub(&color, &meanColorScaled);
-		float d = vec4F_dot(&q, &axis);
+		const vec4F q = vec4F_sub(&color, &meanColorScaled);
+		const float d = vec4F_dot(&q, &axis);
 
-		l = minimumf(l, d);
-		h = maximumf(h, d);
+		lo = minimumf(lo, d);
+		hi = maximumf(hi, d);
 	}
 
-	l *= (1.0f / 255.0f);
-	h *= (1.0f / 255.0f);
+	lo *= (1.0f / 255.0f);
+	hi *= (1.0f / 255.0f);
 
-	vec4F b0 = vec4F_mul(&axis, l);
-	vec4F b1 = vec4F_mul(&axis, h);
+	vec4F b0 = vec4F_mul(&axis, lo);
+	vec4F b1 = vec4F_mul(&axis, hi);
 	vec4F c0 = vec4F_add(&meanColor, &b0);
 	vec4F c1 = vec4F_add(&meanColor, &b1);
 	vec4F minColor = vec4F_saturate(&c0);
@@ -2222,9 +3404,12 @@ static uint64_t color_cell_compression(uniform uint32_t mode, const uniform colo
 		maxColor = temp;
 	}
 
-	if (!find_optimal_solution(mode, &minColor, &maxColor, pParams, pResults, pComp_params->m_pbit_search, num_pixels, pPixels))
-		return 0;
-	
+	if (find_optimal_solution(mode, &minColor, &maxColor, pParams, pResults, pComp_params->m_pbit_search, num_pixels, pPixels, pCompAlpha) == 0.0f)
+	{
+		assert(pResults->m_best_overall_err == 0.0f);
+		return 0.0f;
+	}
+
 	if (!refinement)
 		return pResults->m_best_overall_err;
 	
@@ -2246,8 +3431,11 @@ static uint64_t color_cell_compression(uniform uint32_t mode, const uniform colo
 		xl = vec4F_mul(&xl, (1.0f / 255.0f));
 		xh = vec4F_mul(&xh, (1.0f / 255.0f));
 
-		if (!find_optimal_solution(mode, &xl, &xh, pParams, pResults, pComp_params->m_pbit_search, num_pixels, pPixels))
-			return 0;
+		if (find_optimal_solution(mode, &xl, &xh, pParams, pResults, pComp_params->m_pbit_search, num_pixels, pPixels, pCompAlpha) == 0.0f)
+		{
+			assert(pResults->m_best_overall_err == 0.0f);
+			return 0.0f;
+		}
 	}
 
 	if (pComp_params->m_uber_level > 0)
@@ -2293,8 +3481,11 @@ static uint64_t color_cell_compression(uniform uint32_t mode, const uniform colo
 			xl = vec4F_mul(&xl, (1.0f / 255.0f));
 			xh = vec4F_mul(&xh, (1.0f / 255.0f));
 
-			if (!find_optimal_solution(mode, &xl, &xh, pParams, pResults, pComp_params->m_pbit_search, num_pixels, pPixels))
-				return 0;
+			if (find_optimal_solution(mode, &xl, &xh, pParams, pResults, pComp_params->m_pbit_search, num_pixels, pPixels, pCompAlpha) == 0.0f)
+			{
+				assert(pResults->m_best_overall_err == 0.0f);
+				return 0.0f;
+			}
 		}
 
 		if (pComp_params->m_uber1_mask & 2)
@@ -2319,8 +3510,11 @@ static uint64_t color_cell_compression(uniform uint32_t mode, const uniform colo
 			xl = vec4F_mul(&xl, (1.0f / 255.0f));
 			xh = vec4F_mul(&xh, (1.0f / 255.0f));
 
-			if (!find_optimal_solution(mode, &xl, &xh, pParams, pResults, pComp_params->m_pbit_search, num_pixels, pPixels))
-				return 0;
+			if (find_optimal_solution(mode, &xl, &xh, pParams, pResults, pComp_params->m_pbit_search, num_pixels, pPixels, pCompAlpha) == 0.0f)
+			{
+				assert(pResults->m_best_overall_err == 0.0f);
+				return 0.0f;
+			}
 		}
 
 		if (pComp_params->m_uber1_mask & 4)
@@ -2347,11 +3541,18 @@ static uint64_t color_cell_compression(uniform uint32_t mode, const uniform colo
 			xl = vec4F_mul(&xl, (1.0f / 255.0f));
 			xh = vec4F_mul(&xh, (1.0f / 255.0f));
 
-			if (!find_optimal_solution(mode, &xl, &xh, pParams, pResults, pComp_params->m_pbit_search, num_pixels, pPixels))
-				return 0;
+			if (find_optimal_solution(mode, &xl, &xh, pParams, pResults, pComp_params->m_pbit_search, num_pixels, pPixels, pCompAlpha) == 0.0f)
+			{
+				assert(pResults->m_best_overall_err == 0.0f);
+				return 0.0f;
+			}
 		}
 
-		const uint32_t uber_err_thresh = (num_pixels * 56) >> 4;
+		uniform float weightSum = pParams->m_weights[0] + pParams->m_weights[1] + pParams->m_weights[2];
+		if (!pParams->m_optimize_for_color_times_alpha)
+			weightSum += pParams->m_weights[3];
+		const uniform float avgErrorSum = weightSum * 0.875f;
+		const float uber_err_thresh = (float)(int)num_pixels * avgErrorSum;
 		if ((pComp_params->m_uber_level >= 2) && (pResults->m_best_overall_err > uber_err_thresh))
 		{
 			const uniform int Q = (pComp_params->m_uber_level >= 4) ? (pComp_params->m_uber_level - 2) : 1;
@@ -2363,7 +3564,7 @@ static uint64_t color_cell_compression(uniform uint32_t mode, const uniform colo
 						continue;
 
 					for (uniform uint32_t i = 0; i < num_pixels; i++)
-						selectors_temp1[i] = (int)clampf(floor((float)max_selector * ((float)(int)selectors_temp[i] - (float)ly) / ((float)hy - (float)ly) + .5f), 0, (float)max_selector);
+						selectors_temp1[i] = (int)clampf(round((float)max_selector * ((float)(int)selectors_temp[i] - (float)ly) / ((float)hy - (float)ly)), 0, (float)max_selector);
 
 					vec4F_set_scalar(&xl, 0.0f);
 					vec4F_set_scalar(&xh, 0.0f);
@@ -2379,8 +3580,11 @@ static uint64_t color_cell_compression(uniform uint32_t mode, const uniform colo
 					xl = vec4F_mul(&xl, (1.0f / 255.0f));
 					xh = vec4F_mul(&xh, (1.0f / 255.0f));
 
-					if (!find_optimal_solution(mode, &xl, &xh, pParams, pResults, pComp_params->m_pbit_search && (pComp_params->m_uber_level >= 2), num_pixels, pPixels))
-						return 0;
+					if (find_optimal_solution(mode, &xl, &xh, pParams, pResults, pComp_params->m_pbit_search && (pComp_params->m_uber_level >= 2), num_pixels, pPixels, pCompAlpha) == 0.0f)
+					{
+						assert(pResults->m_best_overall_err == 0.0f);
+						return 0.0f;
+					}
 				}
 			}
 		}
@@ -2399,7 +3603,7 @@ static uint64_t color_cell_compression(uniform uint32_t mode, const uniform colo
 		const uint32_t b = (int)(.5f + meanColor.m_c[2] * 255.0f);
 		const uint32_t a = (int)(.5f + meanColor.m_c[3] * 255.0f);
 
-		uint64_t avg_err;
+		float avg_err;
 		if (mode == 0)
 			avg_err = pack_mode0_to_one_color(pParams, &avg_results, r, g, b, pResults->m_pSelectors_temp, num_pixels, pPixels);
 		else if (mode == 1)
@@ -2409,7 +3613,7 @@ static uint64_t color_cell_compression(uniform uint32_t mode, const uniform colo
 		else if (mode == 7)
 			avg_err = pack_mode7_to_one_color(pParams, &avg_results, r, g, b, a, pResults->m_pSelectors_temp, num_pixels, pPixels);
 		else
-			avg_err = pack_mode24_to_one_color(pParams, &avg_results, r, g, b, pResults->m_pSelectors_temp, num_pixels, pPixels);
+			avg_err = pack_mode24_to_one_color(pParams, &avg_results, r, g, b, pResults->m_pSelectors_temp, num_pixels, pPixels, pCompAlpha);
 
 		if (avg_err < pResults->m_best_overall_err)
 		{
@@ -2427,215 +3631,316 @@ static uint64_t color_cell_compression(uniform uint32_t mode, const uniform colo
 	return pResults->m_best_overall_err;
 }
 
-static uint64_t color_cell_compression_est(uniform uint32_t mode, const uniform color_cell_compressor_params *uniform pParams, uint64_t best_err_so_far, uniform uint32_t num_pixels, const varying color_quad_i *uniform pPixels)
+// The improvements in the error estimation are:
+//  - It detects channels that vary in opposite directions, instead of assuming positive correlation. (This is the more important improvement.)
+//  - It accounts for non-uniform error weights when picking the closest index on the color line. (This is a minor improvement, but very cheap.)
+//  - The perceptual error metric uses hard-coded non-uniform error weights. (This actually happens in the calling code.)
+static float color_cell_compression_est(uniform uint32_t mode, const uniform partition_estimate_params *uniform pParams, uniform uint32_t num_pixels, const varying color_quad_i *uniform pPixels)
 {
-	assert((pParams->m_num_selector_weights == 4) || (pParams->m_num_selector_weights == 8));
+	// We want to use the covariance of the color channels to get the right signs. For example, if you have a generally red
+	// area and a generally blue area meeting with a soft boundary, you'll get negative covariance in red and green.
+	//
+	// We can find means and covariance in a single pass. Assume two variables X[i],Y[i] with N samples that have means A,B.
+	//   A = 1/N * sum[i=0..N-1]{X[i]}
+	//   B = 1/N * sum[i=0..N-1]{Y[i]}
+	//   V = sum[i=0..N-1]{(X[i] - A)(Y[i] - B)}
+	// Lets drop [] for shorthand and simplify.
+	//   V = sum{X Y - A Y - B X + A B}
+	//     = sum{X Y} - A sum{Y} - B sum{X} + A B sum{1}
+	//     = sum{X Y} - A B N - B A N + A B N
+	//     = sum{X Y} - sum{X} sum{Y} / N
+	// We only want the sign, so we can do:
+	//   N V = N sum{X Y} - sum{X} sum{Y}
+	// Each of these requires just a single pass. Also, note that X and Y can be the same to calculate variance.
+	//
+	// Normally, you wouldn't do this for numerical stability, but we're dealing with at most 16 8-bit integers.
+	// The {X Y} sums are at most 16 copies of 8-bit products multiplied by at most 16, so it fits in 4 + 8 + 8 + 4 = 24 bits.
+	// The {X} {Y} products multiply terms that sum up to 16 8-bit integers, so it fits in (4 + 8) * 2 = 24 bits.
+	// 32-bit floats have 24-bit mantissas, so all these terms fit losslessly in a float. That means the subtraction
+	// will also be exact, and this calculation is guaranteed to give the exact right result.
+	//
+	// As an optimization, we actually only calculate variance relative to green. This won't catch red and blue going in
+	// opposite directions when green is constant.
 
-	float lr = 255, lg = 255, lb = 255;
-	float hr = 0, hg = 0, hb = 0;
+	float sum_r = 0.0f;
+	float sum_g = 0.0f;
+	float sum_b = 0.0f;
+
+	float mins_r = 255.0f;
+	float mins_g = 255.0f;
+	float mins_b = 255.0f;
+	float maxs_r = 0.0f;
+	float maxs_g = 0.0f;
+	float maxs_b = 0.0f;
+
+	float cov_gr = 0;
+	float cov_gb = 0;
+
 	for (uniform uint32_t i = 0; i < num_pixels; i++)
 	{
-		const varying color_quad_i *uniform pC = &pPixels[i];
+		float r = (float)pPixels[i].m_c[0];
+		float g = (float)pPixels[i].m_c[1];
+		float b = (float)pPixels[i].m_c[2];
 
-		float r = pC->m_c[0];
-		float g = pC->m_c[1];
-		float b = pC->m_c[2];
-		
-		lr = min(lr, r);
-		lg = min(lg, g);
-		lb = min(lb, b);
+		mins_r = min(mins_r, r);
+		mins_g = min(mins_g, g);
+		mins_b = min(mins_b, b);
 
-		hr = max(hr, r);
-		hg = max(hg, g);
-		hb = max(hb, b);
+		maxs_r = max(maxs_r, r);
+		maxs_g = max(maxs_g, g);
+		maxs_b = max(maxs_b, b);
+
+		sum_r += r;
+		sum_g += g;
+		sum_b += b;
+
+		cov_gr += g * r;
+		cov_gb += g * b;
 	}
-			
-	const uniform uint32_t N = 1 << g_bc7_color_index_bitcount[mode];
-						
-	uint64_t total_err = 0;
-	
-	float sr = lr;
-	float sg = lg;
-	float sb = lb;
 
-	float dir = hr - lr;
-	float dig = hg - lg;
-	float dib = hb - lb;	
+	float dr = maxs_r - mins_r;
+	float dg = maxs_g - mins_g;
+	float db = maxs_b - mins_b;
+	float base_r = mins_r;
+	float base_g = mins_g;
+	float base_b = mins_b;
 
-	float far = dir;
-	float fag = dig;
-	float fab = dib;
-
-	float low = far * sr + fag * sg + fab * sb;
-	float high = far * hr + fag * hg + fab * hb;
-
-	float scale = ((float)N - 1) / (float)(high - low);
-	float inv_n = 1.0f / ((float)N - 1);
-
-	float total_errf = 0;
-
-	// We don't handle perceptual very well here, but the difference is very slight (<.05 dB avg Luma PSNR across a large corpus) and the perf lost was high (2x slower).
-	if ((pParams->m_weights[0] != 1) || (pParams->m_weights[1] != 1) || (pParams->m_weights[2] != 1))
+	if (dg > 4.0f)
 	{
-		float wr = pParams->m_weights[0];
-		float wg = pParams->m_weights[1];
-		float wb = pParams->m_weights[2];
-
-		for (uniform uint32_t i = 0; i < num_pixels; i++)
+		if (cov_gr * num_pixels < sum_g * sum_r)
 		{
-			const varying color_quad_i *uniform pC = &pPixels[i];
-
-			float d = far * (float)pC->m_c[0] + fag * (float)pC->m_c[1] + fab * (float)pC->m_c[2];
-
-			float s = clamp(floor((d - low) * scale + .5f) * inv_n, 0.0f, 1.0f);
-
-			float itr = sr + dir * s;
-			float itg = sg + dig * s;
-			float itb = sb + dib * s;
-
-			float dr = itr - (float)pC->m_c[0];
-			float dg = itg - (float)pC->m_c[1];
-			float db = itb - (float)pC->m_c[2];
-
-			total_errf += wr * dr * dr + wg * dg * dg + wb * db * db;
+			dr = -dr;
+			base_r = maxs_r;
 		}
-	}
-	else
-	{
-		for (uniform uint32_t i = 0; i < num_pixels; i++)
+		if (cov_gb * num_pixels < sum_g * sum_b)
 		{
-			const varying color_quad_i *uniform pC = &pPixels[i];
-
-			float d = far * (float)pC->m_c[0] + fag * (float)pC->m_c[1] + fab * (float)pC->m_c[2];
-
-			float s = clamp(floor((d - low) * scale + .5f) * inv_n, 0.0f, 1.0f);
-
-			float itr = sr + dir * s;
-			float itg = sg + dig * s;
-			float itb = sb + dib * s;
-
-			float dr = itr - (float)pC->m_c[0];
-			float dg = itg - (float)pC->m_c[1];
-			float db = itb - (float)pC->m_c[2];
-
-			total_errf += dr * dr + dg * dg + db * db;
+			db = -db;
+			base_b = maxs_b;
 		}
 	}
 
-	total_err = (int64_t)total_errf;
+	// Get the per-channel error weights.
+	uniform const float wr = pParams->m_weights[0];
+	uniform const float wg = pParams->m_weights[1];
+	uniform const float wb = pParams->m_weights[2];
 
-	return total_err;
+	// To get the palette entry:
+	//   N = max index
+	//   f = (color - base) . delta / |delta|^2
+	//   i = clamp(round(f * N), 0, N)
+	//   p = base + (i / N) * delta
+	// It turns out that delta -> delta / N simplifies this. Divide delta by k:
+	//   f' = (color - base) . delta / |delta|^2 * k^2 / k = f * k
+	//   i = clamp(round(f * N), 0, N) = clamp(round(f' * N/k), 0, N)
+	//   p = base + i * delta * N/k
+	// So, if delta -> delta / N, the N/k constants become 1, and everything simplifies:
+	//   f = (color - base) . delta / |delta|^2
+	//   i = clamp(round(f), 0, N)
+	//   p = base + i * delta
+	// We want the delta, which is the length of:
+	//   color - p = (color - base) - i * delta
+	//
+	// The error metric is a weighted sum of the squares of the per-channel errors. This is equivalent to an unweighted distance in
+	// "error space". In this space, we just scale each color channel by the square root of its weight. The normal Cartesian distance
+	// in this space exactly matches the error metric. This is important for non-uniform error weights. The dot product in the error
+	// space and the dot product in the original color space can give different distances along the color line, which can cause it to
+	// choose different interpolants, which can give different errors.
+	//
+	// Conveniently, we don't need to take the square roots to get this behavior. Consider 2D for brevity, with square root weights
+	// "Wx" and "Wy" and color vectors "A" and "B".
+	//    dot = (Wx Ax) (Wx Bx) + (Wy Ay) (Wy By)
+	//        = Wx^2 (Ax Bx) + Wy^2 (Ay By)
+	// So, the result is the same if we just scale the individual products in the dot product before summing them.
+
+	dr *= pParams->m_rcp_max_selector;
+	dg *= pParams->m_rcp_max_selector;
+	db *= pParams->m_rcp_max_selector;
+	float wdr = dr * wr;
+	float wdg = dg * wg;
+	float wdb = db * wb;
+	float lenSq = dr * wdr + dg * wdg + db * wdb;
+	float norm = 1.0f / max(1.0f / 64.0f, lenSq);	// The minimum non-zero value for lenSq is 1 / 7^2
+	wdr *= norm;
+	wdg *= norm;
+	wdb *= norm;
+
+	// Now we can quickly estimate error. This makes several simplifying approximations:
+	//  - It assumes the best end points are the mins/maxs of the bounding box
+	//  - It assumes each end point uses 8 independent bits
+	//  - It assumes the interpolation fractions are 1/3 and 2/3 (they are actually 21/64 and 43/64)
+	//  - It assumes the closest color to the projection on the color axis is the closest color to the pixel
+	float err_est = 0.0f;
+	for (uniform uint32_t i = 0; i < num_pixels; i++)
+	{
+		float rel_r = (float)pPixels[i].m_c[0] - base_r;
+		float rel_g = (float)pPixels[i].m_c[1] - base_g;
+		float rel_b = (float)pPixels[i].m_c[2] - base_b;
+		float dot = rel_r * wdr + rel_g * wdg + rel_b * wdb;
+		float t = clamp(round(dot), 0.0f, pParams->m_max_selector);
+		rel_r -= t * dr;
+		rel_g -= t * dg;
+		rel_b -= t * db;
+		err_est += wr * rel_r * rel_r + wg * rel_g * rel_g + wb * rel_b * rel_b;
+	}
+//	DEBUG_SPAM(pParams, "     result %\n", err_est);
+	return err_est;
 }
 
-static uint64_t color_cell_compression_est_mode7(uniform uint32_t mode, const uniform color_cell_compressor_params *uniform pParams, uint64_t best_err_so_far, uniform uint32_t num_pixels, const varying color_quad_i *uniform pPixels)
+static float color_cell_compression_est_mode7(uniform uint32_t mode, const uniform partition_estimate_params *uniform pParams, uniform uint32_t num_pixels, const varying color_quad_i *uniform pPixels)
 {
-	assert((mode == 7) && (pParams->m_num_selector_weights == 4));
+	// This is almost the same as 'color_cell_compression_est_hq' and uses the same derivations.
+	// The only differences are that it includes alpha and assumes pParams->m_num_selector_weights == 4.
+	float sum_r = 0.0f;
+	float sum_g = 0.0f;
+	float sum_b = 0.0f;
+	float sum_a = 0.0f;
 
-	float lr = 255, lg = 255, lb = 255, la = 255;
-	float hr = 0, hg = 0, hb = 0, ha = 0;
+	float mins_r = 255.0f;
+	float mins_g = 255.0f;
+	float mins_b = 255.0f;
+	float mins_a = 255.0f;
+	float maxs_r = 0.0f;
+	float maxs_g = 0.0f;
+	float maxs_b = 0.0f;
+	float maxs_a = 0.0f;
+
+	float cov_gr = 0;
+	float cov_gb = 0;
+	float cov_ga = 0;
+
 	for (uniform uint32_t i = 0; i < num_pixels; i++)
 	{
-		const varying color_quad_i *uniform pC = &pPixels[i];
+		float r = (float)pPixels[i].m_c[0];
+		float g = (float)pPixels[i].m_c[1];
+		float b = (float)pPixels[i].m_c[2];
+		float a = (float)pPixels[i].m_c[3];
 
-		float r = pC->m_c[0];
-		float g = pC->m_c[1];
-		float b = pC->m_c[2];
-		float a = pC->m_c[3];
-		
-		lr = min(lr, r);
-		lg = min(lg, g);
-		lb = min(lb, b);
-		la = min(la, a);
+		mins_r = min(mins_r, r);
+		mins_g = min(mins_g, g);
+		mins_b = min(mins_b, b);
+		mins_a = min(mins_a, a);
 
-		hr = max(hr, r);
-		hg = max(hg, g);
-		hb = max(hb, b);
-		ha = max(ha, a);
+		maxs_r = max(maxs_r, r);
+		maxs_g = max(maxs_g, g);
+		maxs_b = max(maxs_b, b);
+		maxs_a = max(maxs_a, a);
+
+		sum_r += r;
+		sum_g += g;
+		sum_b += b;
+		sum_a += a;
+
+		cov_gr += g * r;
+		cov_gb += g * b;
+		cov_ga += g * a;
 	}
-			
-	const uniform uint32_t N = 4;
-						
-	uint64_t total_err = 0;
-	
-	float sr = lr;
-	float sg = lg;
-	float sb = lb;
-	float sa = la;
 
-	float dir = hr - lr;
-	float dig = hg - lg;
-	float dib = hb - lb;	
-	float dia = ha - la;	
+	float dr = maxs_r - mins_r;
+	float dg = maxs_g - mins_g;
+	float db = maxs_b - mins_b;
+	float da = maxs_a - mins_a;
+	float base_r = mins_r;
+	float base_g = mins_g;
+	float base_b = mins_b;
+	float base_a = mins_a;
 
-	float far = dir;
-	float fag = dig;
-	float fab = dib;
-	float faa = dia;
-
-	float low = far * sr + fag * sg + fab * sb + faa * sa;
-	float high = far * hr + fag * hg + fab * hb + faa * ha;
-
-	float scale = ((float)N - 1) / (float)(high - low);
-	float inv_n = 1.0f / ((float)N - 1);
-
-	float total_errf = 0;
-
-	// We don't handle perceptual very well here, but the difference is very slight (<.05 dB avg Luma PSNR across a large corpus) and the perf lost was high (2x slower).
-	if ( (!pParams->m_perceptual) && ((pParams->m_weights[0] != 1) || (pParams->m_weights[1] != 1) || (pParams->m_weights[2] != 1) || (pParams->m_weights[3] != 1)) )
+	if (dg > 4.0f)
 	{
-		float wr = pParams->m_weights[0];
-		float wg = pParams->m_weights[1];
-		float wb = pParams->m_weights[2];
-		float wa = pParams->m_weights[3];
-
-		for (uniform uint32_t i = 0; i < num_pixels; i++)
+		if (cov_gr * num_pixels < sum_g * sum_r)
 		{
-			const varying color_quad_i *uniform pC = &pPixels[i];
-
-			float d = far * (float)pC->m_c[0] + fag * (float)pC->m_c[1] + fab * (float)pC->m_c[2] + faa * (float)pC->m_c[3];
-
-			float s = clamp(floor((d - low) * scale + .5f) * inv_n, 0.0f, 1.0f);
-
-			float itr = sr + dir * s;
-			float itg = sg + dig * s;
-			float itb = sb + dib * s;
-			float ita = sa + dia * s;
-
-			float dr = itr - (float)pC->m_c[0];
-			float dg = itg - (float)pC->m_c[1];
-			float db = itb - (float)pC->m_c[2];
-			float da = ita - (float)pC->m_c[3];
-
-			total_errf += wr * dr * dr + wg * dg * dg + wb * db * db + wa * da * da;
+			dr = -dr;
+			base_r = maxs_r;
 		}
+		if (cov_gb * num_pixels < sum_g * sum_b)
+		{
+			db = -db;
+			base_b = maxs_b;
+		}
+		if (cov_ga * num_pixels < sum_g * sum_a)
+		{
+			da = -da;
+			base_a = maxs_a;
+		}
+	}
+
+	// Get the per-channel error weights.
+	uniform float wr = pParams->m_weights[0];
+	uniform float wg = pParams->m_weights[1];
+	uniform float wb = pParams->m_weights[2];
+	uniform float wa = pParams->m_weights[3];
+
+	// get lookup constants
+	dr *= pParams->m_rcp_max_selector;
+	dg *= pParams->m_rcp_max_selector;
+	db *= pParams->m_rcp_max_selector;
+	da *= pParams->m_rcp_max_selector;
+	float wdr = dr * wr;
+	float wdg = dg * wg;
+	float wdb = db * wb;
+	float wda = da * wa;
+	float lenSq = dr * wdr + dg * wdg + db * wdb + da * wda;
+	float norm = 1.0f / max(1.0f / 16.0f, lenSq);	// The minimum non-zero value for lenSq is 1 / 3^2
+	wdr *= norm;
+	wdg *= norm;
+	wdb *= norm;
+	wda *= norm;
+
+	// estimate error
+	// NOTE: Simple per-channel weighting actually gave lower error for color times alpha in my test cases than trying to
+	// account for color times alpha in this error metric. It's also less work.
+	float err_est = 0.0f;
+	for (uniform uint32_t i = 0; i < num_pixels; i++)
+	{
+		float rel_r = (float)pPixels[i].m_c[0] - base_r;
+		float rel_g = (float)pPixels[i].m_c[1] - base_g;
+		float rel_b = (float)pPixels[i].m_c[2] - base_b;
+		float rel_a = (float)pPixels[i].m_c[3] - base_a;
+		float dot = rel_r * wdr + rel_g * wdg + rel_b * wdb + rel_a * wda;
+		float t = clamp(round(dot), 0.0f, pParams->m_max_selector);
+		rel_r -= t * dr;
+		rel_g -= t * dg;
+		rel_b -= t * db;
+		rel_a -= t * da;
+		err_est += wr * rel_r * rel_r + wg * rel_g * rel_g + wb * rel_b * rel_b + wa * rel_a * rel_a;
+	}
+	return err_est;
+}
+
+static inline void partition_estimate_params_init(uniform partition_estimate_params *uniform pParams, uniform uint32_t mode, const uniform bc7e_compress_block_params *uniform pComp_params)
+{
+	pParams->m_debug_spam = pComp_params->m_debugSpam;
+
+	pParams->m_max_selector = (float)(1 << g_bc7_color_index_bitcount[mode]) - 1.0f;
+	pParams->m_rcp_max_selector = 1.0f / pParams->m_max_selector;
+
+	if (pComp_params->m_perceptual)
+	{
+		pParams->m_weights[0] = k_est_wt_r;
+		pParams->m_weights[1] = k_est_wt_g;
+		pParams->m_weights[2] = k_est_wt_b;
+		pParams->m_weights[3] = k_est_wt_a;
 	}
 	else
 	{
-		for (uniform uint32_t i = 0; i < num_pixels; i++)
+		pParams->m_weights[0] = pComp_params->m_weights[0];
+		pParams->m_weights[1] = pComp_params->m_weights[1];
+		pParams->m_weights[2] = pComp_params->m_weights[2];
+		pParams->m_weights[3] = pComp_params->m_weights[3];
+		if (mode >= 6)
 		{
-			const varying color_quad_i *uniform pC = &pPixels[i];
-
-			float d = far * (float)pC->m_c[0] + fag * (float)pC->m_c[1] + fab * (float)pC->m_c[2] + faa * (float)pC->m_c[3];
-
-			float s = clamp(floor((d - low) * scale + .5f) * inv_n, 0.0f, 1.0f);
-
-			float itr = sr + dir * s;
-			float itg = sg + dig * s;
-			float itb = sb + dib * s;
-			float ita = sa + dia * s;
-
-			float dr = itr - (float)pC->m_c[0];
-			float dg = itg - (float)pC->m_c[1];
-			float db = itb - (float)pC->m_c[2];
-			float da = ita - (float)pC->m_c[3];
-
-			total_errf += dr * dr + dg * dg + db * db + da * da;
+			pParams->m_weights[0] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[0];
+			pParams->m_weights[1] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[1];
+			pParams->m_weights[2] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[2];
+			pParams->m_weights[3] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[3];
 		}
 	}
 
-	total_err = (int64_t)total_errf;
-
-	return total_err;
+	// For performance, "m_optimize_for_color_times_alpha" is ignored for color error metrics in evaluating partitions.
+	// However, we do use it to set the alpha weight reasonably.
+	// (In fact, this simpler alpha weight had lower final error than trying to account for color times alpha.)
+	const bool optimize_for_color_times_alpha = (pComp_params->m_optimize_for != BC7E_OPTIMIZE_FOR_INDEPENDENT_CHANNELS);
+	if (optimize_for_color_times_alpha)
+		pParams->m_weights[3] = pParams->m_weights[0] + pParams->m_weights[1] + pParams->m_weights[2];
 }
 
 static uint32_t estimate_partition(uniform uint32_t mode, const varying color_quad_i *uniform pPixels, const uniform bc7e_compress_block_params *uniform pComp_params)
@@ -2646,26 +3951,11 @@ static uint32_t estimate_partition(uniform uint32_t mode, const varying color_qu
 	if (total_partitions <= 1)
 		return 0;
 
-	uint64_t best_err = UINT64_MAX;
+	float best_err = FLT_MAX;
 	uint32_t best_partition = 0;
 
-	uniform color_cell_compressor_params params;
-	color_cell_compressor_params_clear(&params);
-
-	params.m_pSelector_weights = (g_bc7_color_index_bitcount[mode] == 2) ? g_bc7_weights2 : g_bc7_weights3;
-	params.m_num_selector_weights = 1 << g_bc7_color_index_bitcount[mode];
-
-	memcpy(params.m_weights, pComp_params->m_weights, sizeof(params.m_weights));
-	
-	if (mode >= 6)
-	{
-		params.m_weights[0] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[0];
-		params.m_weights[1] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[1];
-		params.m_weights[2] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[2];
-		params.m_weights[3] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[3];
-	}
-
-	params.m_perceptual = pComp_params->m_perceptual;
+	uniform partition_estimate_params params;
+	partition_estimate_params_init(&params, mode, pComp_params);
 
 	for (uniform uint32_t partition = 0; partition < total_partitions; partition++)
 	{
@@ -2676,7 +3966,7 @@ static uint32_t estimate_partition(uniform uint32_t mode, const varying color_qu
 		subset_total_colors[0] = 0;
 		subset_total_colors[1] = 0;
 		subset_total_colors[2] = 0;
-		
+
 		for (uniform uint32_t index = 0; index < 16; index++)
 		{
 			const uniform uint32_t p = pPartition[index];
@@ -2685,15 +3975,15 @@ static uint32_t estimate_partition(uniform uint32_t mode, const varying color_qu
 			subset_total_colors[p]++;
 		}
 
-		uint64_t total_subset_err = 0;
+		float total_subset_err = 0;
 
 		for (uniform uint32_t subset = 0; subset < total_subsets; subset++)
 		{
-			uint64_t err;
+			float err;
 			if (mode == 7)
-				err = color_cell_compression_est_mode7(mode, &params, best_err, subset_total_colors[subset], &subset_colors[subset][0]);
+				err = color_cell_compression_est_mode7(mode, &params, subset_total_colors[subset], &subset_colors[subset][0]);
 			else
-				err = color_cell_compression_est(mode, &params, best_err, subset_total_colors[subset], &subset_colors[subset][0]);
+				err = color_cell_compression_est(mode, &params, subset_total_colors[subset], &subset_colors[subset][0]);
 
 			total_subset_err += err;
 
@@ -2703,7 +3993,7 @@ static uint32_t estimate_partition(uniform uint32_t mode, const varying color_qu
 		{
 			best_err = total_subset_err;
 			best_partition = partition;
-			if (!best_err)
+			if (best_err == 0.0f)
 				break;
 		}
 
@@ -2721,7 +4011,7 @@ static uint32_t estimate_partition(uniform uint32_t mode, const varying color_qu
 struct solution
 {
 	uint32_t m_index;
-	uint64_t m_err;
+	float m_err;
 };
 
 static uniform uint32_t estimate_partition_list(uniform uint32_t mode, const varying color_quad_i *uniform pPixels, const uniform bc7e_compress_block_params *uniform pComp_params, 
@@ -2735,7 +4025,7 @@ static uniform uint32_t estimate_partition_list(uniform uint32_t mode, const var
 	if (total_partitions <= 1)
 	{
 		pSolutions[0].m_index = 0;
-		pSolutions[0].m_err = 0;
+		pSolutions[0].m_err = 0.0f;			// this is a nonsense error, but it doesn't matter
 		return 1;
 	}
 	else if (max_solutions >= total_partitions)
@@ -2743,7 +4033,7 @@ static uniform uint32_t estimate_partition_list(uniform uint32_t mode, const var
 		for (uniform int i = 0; i < total_partitions; i++)
 		{
 			pSolutions[i].m_index = i;
-			pSolutions[i].m_err = i;
+			pSolutions[i].m_err = (float)i;	// this is a nonsense error, but it doesn't matter and it keeps them sorted
 		}
 		return total_partitions;
 	}
@@ -2754,29 +4044,15 @@ static uniform uint32_t estimate_partition_list(uniform uint32_t mode, const var
 		if (max_solutions < HIGH_FREQUENCY_SORTED_PARTITION_THRESHOLD)
 			max_solutions = HIGH_FREQUENCY_SORTED_PARTITION_THRESHOLD;
 	}
-						
-	uniform color_cell_compressor_params params;
-	color_cell_compressor_params_clear(&params);
 
-	params.m_pSelector_weights = (g_bc7_color_index_bitcount[mode] == 2) ? g_bc7_weights2 : g_bc7_weights3;
-	params.m_num_selector_weights = 1 << g_bc7_color_index_bitcount[mode];
-
-	memcpy(params.m_weights, pComp_params->m_weights, sizeof(params.m_weights));
-
-	if (mode >= 6)
-	{
-		params.m_weights[0] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[0];
-		params.m_weights[1] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[1];
-		params.m_weights[2] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[2];
-		params.m_weights[3] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[3];
-	}
-
-	params.m_perceptual = pComp_params->m_perceptual;
+	uniform partition_estimate_params params;
+	partition_estimate_params_init(&params, mode, pComp_params);
 
 	uniform int32_t num_solutions = 0;
 
 	for (uniform uint32_t partition = 0; partition < total_partitions; partition++)
 	{
+//		DEBUG_SPAM(&params, "   err est partition %\n", partition);
 		const int *uniform pPartition = (total_subsets == 3) ? &g_bc7_partition3[partition * 16] : &g_bc7_partition2[partition * 16];
 
 		varying color_quad_i subset_colors[3][16];
@@ -2793,19 +4069,21 @@ static uniform uint32_t estimate_partition_list(uniform uint32_t mode, const var
 			subset_total_colors[p]++;
 		}
 				
-		uint64_t total_subset_err = 0;
+		float total_subset_err = 0.0f;
 
 		for (uniform uint32_t subset = 0; subset < total_subsets; subset++)
 		{
-			uint64_t err;
+			float err;
 			if (mode == 7)
-				err = color_cell_compression_est_mode7(mode, &params, UINT64_MAX, subset_total_colors[subset], &subset_colors[subset][0]);
+				err = color_cell_compression_est_mode7(mode, &params, subset_total_colors[subset], &subset_colors[subset][0]);
 			else
-				err = color_cell_compression_est(mode, &params, UINT64_MAX, subset_total_colors[subset], &subset_colors[subset][0]);
+				err = color_cell_compression_est(mode, &params, subset_total_colors[subset], &subset_colors[subset][0]);
 
 			total_subset_err += err;
 
+//			DEBUG_SPAM(&params, "     subset % error %\n", subset, err);
 		} // subset
+//		DEBUG_SPAM(&params, "    total error %\n", total_subset_err);
 
 		int32_t i;
 		for (i = 0; i < num_solutions; i++)
@@ -2902,6 +4180,53 @@ struct bc7_optimization_results
 	uint32_t m_rotation;
 	uint32_t m_index_selector;
 };
+
+#if BC7E_DEBUG_SPAM
+static void spam_bc7_block(varying bc7_optimization_results *uniform pResults)
+{
+	print("block summary:\n");
+	const uint32_t mode = pResults->m_mode;
+	print("  mode %\n", mode);
+	if (mode == 4 || mode == 5)
+		print("  rotation %\n", pResults->m_rotation);
+	if (mode == 4)
+		print("  index selector %\n", pResults->m_index_selector);
+
+#pragma ignore warning(perf)
+	const uint32_t total_subsets = g_bc7_num_subsets[mode];
+	if (total_subsets > 1)
+		print("  partition %\n", pResults->m_partition);
+	for (uniform uint32_t s = 0; s < total_subsets; s++)
+	{
+		print("  s % r0 %\n", s, pResults->m_low [s].m_c[0]);
+		print("  s % r1 %\n", s, pResults->m_high[s].m_c[0]);
+		print("  s % g0 %\n", s, pResults->m_low [s].m_c[1]);
+		print("  s % g1 %\n", s, pResults->m_high[s].m_c[1]);
+		print("  s % b0 %\n", s, pResults->m_low [s].m_c[2]);
+		print("  s % b1 %\n", s, pResults->m_high[s].m_c[2]);
+		if (mode >= 4)
+		{
+			print("  s % a0 %\n", s, pResults->m_low [s].m_c[3]);
+			print("  s % a1 %\n", s, pResults->m_high[s].m_c[3]);
+		}
+#pragma ignore warning(perf)
+		if (g_bc7_mode_has_p_bits[mode])
+		{
+			print("  s % p0 %\n", s, pResults->m_pbits[s][0]);
+#pragma ignore warning(perf)
+			if (!g_bc7_mode_has_shared_p_bits[mode])
+				print("  s % p1 %\n", s, pResults->m_pbits[s][1]);
+		}
+	}
+	for (uniform uint32_t s = 0; s < 16; ++s)
+		print("  c sel %,%: %\n", s & 3, s >> 2, pResults->m_selectors[s]);
+	if (mode == 4 || mode == 5)
+	{
+		for (uniform uint32_t s = 0; s < 16; ++s)
+			print("  a sel %,%: %\n", s & 3, s >> 2, pResults->m_alpha_selectors[s]);
+	}
+}
+#endif // #if BC7E_DEBUG_SPAM
 
 static void encode_bc7_block(void *pBlock, const varying bc7_optimization_results *uniform pResults)
 {
@@ -3183,13 +4508,13 @@ static inline void encode_bc7_block_mode6(void *pBlock, varying bc7_optimization
 }
 
 static void handle_alpha_block_mode4(const varying color_quad_i *uniform pPixels, const uniform bc7e_compress_block_params *uniform pComp_params, uniform color_cell_compressor_params *uniform pParams, uint32_t lo_a, uint32_t hi_a, 
-	varying bc7_optimization_results *uniform pOpt_results4, varying uint64_t *uniform pMode4_err)
+	varying bc7_optimization_results *uniform pOpt_results4, varying float *uniform pMode4_err)
 {
 	pParams->m_has_alpha = false;
 	pParams->m_comp_bits = 5;
 	pParams->m_has_pbits = false;
 	pParams->m_endpoints_share_pbit = false;				
-	pParams->m_perceptual = pComp_params->m_perceptual;
+	assert(pParams->m_perceptual == pComp_params->m_perceptual);
 
 	for (uniform uint32_t index_selector = 0; index_selector < 2; index_selector++)
 	{
@@ -3208,17 +4533,7 @@ static void handle_alpha_block_mode4(const varying color_quad_i *uniform pPixels
 			pParams->m_pSelector_weightsx = (const vec4F * uniform)&g_bc7_weights2x[0];
 			pParams->m_num_selector_weights = 4;
 		}
-								
-		color_cell_compressor_results results;
-		
-		int selectors[16];
-		results.m_pSelectors = selectors;
-
-		int selectors_temp[16];
-		results.m_pSelectors_temp = selectors_temp;
-				
-		uint64_t trial_err = color_cell_compression(4, pParams, &results, pComp_params, 16, pPixels, true);
-		assert(trial_err == results.m_best_overall_err);
+		DEBUG_SPAM(pParams, " handle_alpha_block (mode 4, rotation %, index selector %)\n", pParams->m_rotation, index_selector);
 
 		uint32_t la = minimumi((lo_a + 2) >> 2, 63);
 		uint32_t ha = minimumi((hi_a + 2) >> 2, 63);
@@ -3234,9 +4549,10 @@ static void handle_alpha_block_mode4(const varying color_quad_i *uniform pPixels
 			}
 		}
 
-		uint64_t best_alpha_err = UINT64_MAX;
+		int32_t best_alpha_err = INT32_MAX;	// 16 pixels each having 256 error squared fits in 20 bits
 		uint32_t best_la = 0, best_ha = 0;
 		int best_alpha_selectors[16];
+		int32_t best_alpha_values[16];
 						
 		for (uniform int32_t pass = 0; pass < 2; pass++)
 		{
@@ -3260,31 +4576,34 @@ static void handle_alpha_block_mode4(const varying color_quad_i *uniform pPixels
 				vals[2] = (vals[0] * (64 - w_s2) + vals[3] * w_s2 + 32) >> 6;
 			}
 
-			uint64_t trial_alpha_err = 0;
+			int32_t trial_alpha_err = 0;
 
 			int trial_alpha_selectors[16];
+			int32_t trial_alpha_values[16];
 			for (uniform uint32_t i = 0; i < 16; i++)
 			{
 				const int32_t a = pPixels[i].m_c[3];
 
 				int s = 0;
-				int32_t be = iabs32(a - vals[0]);
+				int32_t bv = vals[0];
+				int32_t be = iabs32(a - bv);
 
-				int e = iabs32(a - vals[1]); if (e < be) { be = e; s = 1; }
-				e = iabs32(a - vals[2]); if (e < be) { be = e; s = 2; }
-				e = iabs32(a - vals[3]); if (e < be) { be = e; s = 3; }
+				int e = iabs32(a - vals[1]); if (e < be) { be = e; s = 1; bv = vals[1]; }
+				e = iabs32(a - vals[2]); if (e < be) { be = e; s = 2; bv = vals[2]; }
+				e = iabs32(a - vals[3]); if (e < be) { be = e; s = 3; bv = vals[3]; }
 
 				if (index_selector == 0)
 				{
-					e = iabs32(a - vals[4]); if (e < be) { be = e; s = 4; }
-					e = iabs32(a - vals[5]); if (e < be) { be = e; s = 5; }
-					e = iabs32(a - vals[6]); if (e < be) { be = e; s = 6; }
-					e = iabs32(a - vals[7]); if (e < be) { be = e; s = 7; }
+					e = iabs32(a - vals[4]); if (e < be) { be = e; s = 4; bv = vals[4]; }
+					e = iabs32(a - vals[5]); if (e < be) { be = e; s = 5; bv = vals[5]; }
+					e = iabs32(a - vals[6]); if (e < be) { be = e; s = 6; bv = vals[6]; }
+					e = iabs32(a - vals[7]); if (e < be) { be = e; s = 7; bv = vals[7]; }
 				}
 
-				trial_alpha_err += (be * be) * pParams->m_weights[3];
+				trial_alpha_err += be * be;
 
 				trial_alpha_selectors[i] = s;
+				trial_alpha_values[i] = bv;
 			}
 
 			if (trial_alpha_err < best_alpha_err)
@@ -3293,17 +4612,20 @@ static void handle_alpha_block_mode4(const varying color_quad_i *uniform pPixels
 				best_la = la;
 				best_ha = ha;
 				for (uniform uint32_t i = 0; i < 16; i++)
+				{
 					best_alpha_selectors[i] = trial_alpha_selectors[i];
+					best_alpha_values[i] = trial_alpha_values[i];
+				}
 			}
 
 			if (pass == 0) 
 			{
-				float xl, xh;
-				compute_least_squares_endpoints_a(16, trial_alpha_selectors, index_selector ? (const vec4F * uniform)&g_bc7_weights2x[0] : (const vec4F * uniform)&g_bc7_weights3x[0], &xl, &xh, pPixels);
-				if (xl > xh)
-					swapf(&xl, &xh);
-				la = clampi((int)floor(xl * (63.0f / 255.0f) + .5f), 0, 63);
-				ha = clampi((int)floor(xh * (63.0f / 255.0f) + .5f), 0, 63);
+				float xa, xb;
+				compute_least_squares_endpoints_a(16, trial_alpha_selectors, index_selector ? (const vec4F * uniform)&g_bc7_weights2x[0] : (const vec4F * uniform)&g_bc7_weights3x[0], &xa, &xb, pPixels);
+				const float xl = min(xa, xb);
+				const float xh = max(xa, xb);
+				la = (int)round(clampf(xl * (63.0f / 255.0f), 0.0f, 63.0f));
+				ha = (int)round(clampf(xh * (63.0f / 255.0f), 0.0f, 63.0f));
 			}
 						
 		} // pass
@@ -3338,31 +4660,34 @@ static void handle_alpha_block_mode4(const varying color_quad_i *uniform pPixels
 						vals[2] = (vals[0] * (64 - w_s2) + vals[3] * w_s2 + 32) >> 6;
 					}
 
-					uint64_t trial_alpha_err = 0;
+					int32_t trial_alpha_err = 0;
 
 					int trial_alpha_selectors[16];
+					int32_t trial_alpha_values[16];
 					for (uniform uint32_t i = 0; i < 16; i++)
 					{
 						const int32_t a = pPixels[i].m_c[3];
 
 						int s = 0;
-						int32_t be = iabs32(a - vals[0]);
+						int32_t bv = vals[0];
+						int32_t be = iabs32(a - bv);
 
-						int e = iabs32(a - vals[1]); if (e < be) { be = e; s = 1; }
-						e = iabs32(a - vals[2]); if (e < be) { be = e; s = 2; }
-						e = iabs32(a - vals[3]); if (e < be) { be = e; s = 3; }
+						int e = iabs32(a - vals[1]); if (e < be) { be = e; s = 1; bv = vals[1]; }
+						e = iabs32(a - vals[2]); if (e < be) { be = e; s = 2; bv = vals[2]; }
+						e = iabs32(a - vals[3]); if (e < be) { be = e; s = 3; bv = vals[3]; }
 
 						if (index_selector == 0)
 						{
-							e = iabs32(a - vals[4]); if (e < be) { be = e; s = 4; }
-							e = iabs32(a - vals[5]); if (e < be) { be = e; s = 5; }
-							e = iabs32(a - vals[6]); if (e < be) { be = e; s = 6; }
-							e = iabs32(a - vals[7]); if (e < be) { be = e; s = 7; }
+							e = iabs32(a - vals[4]); if (e < be) { be = e; s = 4; bv = vals[4]; }
+							e = iabs32(a - vals[5]); if (e < be) { be = e; s = 5; bv = vals[5]; }
+							e = iabs32(a - vals[6]); if (e < be) { be = e; s = 6; bv = vals[6]; }
+							e = iabs32(a - vals[7]); if (e < be) { be = e; s = 7; bv = vals[7]; }
 						}
 
-						trial_alpha_err += (be * be) * pParams->m_weights[3];
+						trial_alpha_err += be * be;
 
 						trial_alpha_selectors[i] = s;
+						trial_alpha_values[i] = bv;
 					}
 
 					if (trial_alpha_err < best_alpha_err)
@@ -3371,7 +4696,10 @@ static void handle_alpha_block_mode4(const varying color_quad_i *uniform pPixels
 						best_la = la;
 						best_ha = ha;
 						for (uniform uint32_t i = 0; i < 16; i++)
+						{
 							best_alpha_selectors[i] = trial_alpha_selectors[i];
+							best_alpha_values[i] = trial_alpha_values[i];
+						}
 					}
 				
 				} // hd
@@ -3379,10 +4707,27 @@ static void handle_alpha_block_mode4(const varying color_quad_i *uniform pPixels
 			} // ld
 		}
 
-		trial_err += best_alpha_err;
+		color_cell_compressor_results results;
+		
+		int selectors[16];
+		results.m_pSelectors = selectors;
+
+		int selectors_temp[16];
+		results.m_pSelectors_temp = selectors_temp;
+				
+		float trial_err = color_cell_compression(4, pParams, &results, pComp_params, 16, pPixels, best_alpha_values, true);
+		assert(trial_err == results.m_best_overall_err);
+
+		// If we don't optimize for color * alpha, and if we're not perceptual or we're not rotated, then color and alpha errors are independent. 
+		// If we optimize for color * alpha, or if we're perceptual with rotation, then color_cell_compression must include alpha error.
+		if (!pParams->m_optimize_for_color_times_alpha && (!pParams->m_perceptual || pParams->m_rotation == 0))
+			trial_err += (float)best_alpha_err * pParams->m_weights[3];
+
+		DEBUG_SPAM(pParams, "  error %\n", trial_err);
 
 		if (trial_err < *pMode4_err)
 		{
+			DEBUG_SPAM(pParams, "  *** better than %\n", *pMode4_err);
 			*pMode4_err = trial_err;
 
 			pOpt_results4->m_mode = 4;
@@ -3406,7 +4751,7 @@ static void handle_alpha_block_mode4(const varying color_quad_i *uniform pPixels
 }
 
 static void handle_alpha_block_mode5(const varying color_quad_i *uniform pPixels, const uniform bc7e_compress_block_params *uniform pComp_params, uniform color_cell_compressor_params *uniform pParams, uint32_t lo_a, uint32_t hi_a, 
-	varying bc7_optimization_results *uniform pOpt_results5, varying uint64_t *uniform pMode5_err)
+	varying bc7_optimization_results *uniform pOpt_results5, varying float *uniform pMode5_err)
 {
 	pParams->m_pSelector_weights = g_bc7_weights2;
 	pParams->m_pSelector_weightsx = (const vec4F * uniform)&g_bc7_weights2x[0];
@@ -3417,31 +4762,26 @@ static void handle_alpha_block_mode5(const varying color_quad_i *uniform pPixels
 	pParams->m_has_pbits = false;
 	pParams->m_endpoints_share_pbit = false;				
 	
-	pParams->m_perceptual = pComp_params->m_perceptual;
-		
-	color_cell_compressor_results results5;
-	results5.m_pSelectors = pOpt_results5->m_selectors;
+	assert(pParams->m_perceptual == pComp_params->m_perceptual);
 
-	int selectors_temp[16];
-	results5.m_pSelectors_temp = selectors_temp;
-
-	*pMode5_err = color_cell_compression(5, pParams, &results5, pComp_params, 16, pPixels, true);
-	assert(*pMode5_err == results5.m_best_overall_err);
-
-	pOpt_results5->m_low[0] = results5.m_low_endpoint;
-	pOpt_results5->m_high[0] = results5.m_high_endpoint;
-
+	int32_t mode5_alpha_err;
+	int32_t best_alpha_values[16];
+	uint8_t best_alpha_lo;
+	uint8_t best_alpha_hi;
 	cif (lo_a == hi_a)
 	{
-		pOpt_results5->m_low[0].m_c[3] = lo_a;
-		pOpt_results5->m_high[0].m_c[3] = hi_a;
+		mode5_alpha_err = 0;
+		best_alpha_lo = lo_a;
+		best_alpha_hi = lo_a;
 		for (uniform uint32_t i = 0; i < 16; i++)
+		{
 			pOpt_results5->m_alpha_selectors[i] = 0;
+			best_alpha_values[i] = lo_a;
+		}
 	}
 	else
 	{
-		uint64_t mode5_alpha_err = UINT64_MAX;
-
+		mode5_alpha_err = INT32_MAX;
 		for (uniform uint32_t pass = 0; pass < 2; pass++)
 		{
 			int32_t vals[4];
@@ -3453,41 +4793,47 @@ static void handle_alpha_block_mode5(const varying color_quad_i *uniform pPixels
 			vals[2] = (vals[0] * (64 - w_s2) + vals[3] * w_s2 + 32) >> 6;
 
 			int trial_alpha_selectors[16];
+			int32_t trial_alpha_values[16];
 
-			uint64_t trial_alpha_err = 0;
+			int32_t trial_alpha_err = 0;
 			for (uniform uint32_t i = 0; i < 16; i++)
 			{
 				const int32_t a = pPixels[i].m_c[3];
 
 				int s = 0;
-				int32_t be = iabs32(a - vals[0]);
-				int e = iabs32(a - vals[1]); if (e < be) { be = e; s = 1; }
-				e = iabs32(a - vals[2]); if (e < be) { be = e; s = 2; }
-				e = iabs32(a - vals[3]); if (e < be) { be = e; s = 3; }
+				int32_t bv = vals[0];
+				int32_t be = iabs32(a - bv);
+				int e = iabs32(a - vals[1]); if (e < be) { be = e; s = 1; bv = vals[1]; }
+				e = iabs32(a - vals[2]); if (e < be) { be = e; s = 2; bv = vals[2]; }
+				e = iabs32(a - vals[3]); if (e < be) { be = e; s = 3; bv = vals[3]; }
 
 				trial_alpha_selectors[i] = s;
-								
-				trial_alpha_err += (be * be) * pParams->m_weights[3];
+				trial_alpha_values[i] = bv;
+
+				trial_alpha_err += be * be;
 			}
 
 			if (trial_alpha_err < mode5_alpha_err)
 			{
 				mode5_alpha_err = trial_alpha_err;
-				pOpt_results5->m_low[0].m_c[3] = lo_a;
-				pOpt_results5->m_high[0].m_c[3] = hi_a;
+				best_alpha_lo = lo_a;
+				best_alpha_hi = hi_a;
 				for (uniform uint32_t i = 0; i < 16; i++)
+				{
 					pOpt_results5->m_alpha_selectors[i] = trial_alpha_selectors[i];
+					best_alpha_values[i] = trial_alpha_values[i];
+				}
 			}
 
 			if (!pass)
 			{
-				float xl, xh;
-				compute_least_squares_endpoints_a(16, trial_alpha_selectors, (const vec4F * uniform)&g_bc7_weights2x[0], &xl, &xh, pPixels);
+				float xa, xb;
+				compute_least_squares_endpoints_a(16, trial_alpha_selectors, (const vec4F * uniform)&g_bc7_weights2x[0], &xa, &xb, pPixels);
+				const float xl = min(xa, xb);
+				const float xh = max(xa, xb);
 
-				uint32_t new_lo_a = clampi((int)floor(xl + .5f), 0, 255);
-				uint32_t new_hi_a = clampi((int)floor(xh + .5f), 0, 255);
-				if (new_lo_a > new_hi_a)
-					swapu(&new_lo_a, &new_hi_a);
+				uint32_t new_lo_a = (int)round(clampf(xl, 0, 255));
+				uint32_t new_hi_a = (int)round(clampf(xh, 0, 255));
 
 				if ((new_lo_a == lo_a) && (new_hi_a == hi_a))
 					break;
@@ -3504,8 +4850,8 @@ static void handle_alpha_block_mode5(const varying color_quad_i *uniform pPixels
 			{
 				for (uniform int hd = -D; hd <= D; hd++)
 				{
-					lo_a = clamp((int)pOpt_results5->m_low[0].m_c[3] + ld, 0, 255);
-					hi_a = clamp((int)pOpt_results5->m_high[0].m_c[3] + hd, 0, 255);
+					lo_a = clamp((int)best_alpha_lo + ld, 0, 255);
+					hi_a = clamp((int)best_alpha_hi + hd, 0, 255);
 					
 					int32_t vals[4];
 					vals[0] = lo_a;
@@ -3516,39 +4862,61 @@ static void handle_alpha_block_mode5(const varying color_quad_i *uniform pPixels
 					vals[2] = (vals[0] * (64 - w_s2) + vals[3] * w_s2 + 32) >> 6;
 
 					int trial_alpha_selectors[16];
+					int32_t trial_alpha_values[16];
 
-					uint64_t trial_alpha_err = 0;
+					int32_t trial_alpha_err = 0;
 					for (uniform uint32_t i = 0; i < 16; i++)
 					{
 						const int32_t a = pPixels[i].m_c[3];
 
 						int s = 0;
-						int32_t be = iabs32(a - vals[0]);
-						int e = iabs32(a - vals[1]); if (e < be) { be = e; s = 1; }
-						e = iabs32(a - vals[2]); if (e < be) { be = e; s = 2; }
-						e = iabs32(a - vals[3]); if (e < be) { be = e; s = 3; }
+						int32_t bv = vals[0];
+						int32_t be = iabs32(a - bv);
+						int e = iabs32(a - vals[1]); if (e < be) { be = e; s = 1; bv = vals[1]; }
+						e = iabs32(a - vals[2]); if (e < be) { be = e; s = 2; bv = vals[2]; }
+						e = iabs32(a - vals[3]); if (e < be) { be = e; s = 3; bv = vals[3]; }
 
 						trial_alpha_selectors[i] = s;
+						trial_alpha_values[i] = bv;
 								
-						trial_alpha_err += (be * be) * pParams->m_weights[3];
+						trial_alpha_err += be * be;
 					}
 
 					if (trial_alpha_err < mode5_alpha_err)
 					{
 						mode5_alpha_err = trial_alpha_err;
-						pOpt_results5->m_low[0].m_c[3] = lo_a;
-						pOpt_results5->m_high[0].m_c[3] = hi_a;
+						best_alpha_lo = lo_a;
+						best_alpha_hi = hi_a;
 						for (uniform uint32_t i = 0; i < 16; i++)
+						{
 							pOpt_results5->m_alpha_selectors[i] = trial_alpha_selectors[i];
+							best_alpha_values[i] = trial_alpha_values[i];
+						}
 					}
 				
 				} // hd
 
 			} // ld
 		}
-
-		*pMode5_err += mode5_alpha_err;
 	}
+
+	color_cell_compressor_results results5;
+	results5.m_pSelectors = pOpt_results5->m_selectors;
+
+	int selectors_temp[16];
+	results5.m_pSelectors_temp = selectors_temp;
+
+	*pMode5_err = color_cell_compression(5, pParams, &results5, pComp_params, 16, pPixels, best_alpha_values, true);
+	assert(*pMode5_err == results5.m_best_overall_err);
+	// If we don't optimize for color * alpha, and if we're not perceptual or we're not rotated, then color and alpha errors are independent. 
+	// If we optimize for color * alpha, or if we're perceptual with rotation, then color_cell_compression must include alpha error.
+	if (!pParams->m_optimize_for_color_times_alpha && (!pParams->m_perceptual || pParams->m_rotation == 0))
+		*pMode5_err += (float)mode5_alpha_err * pParams->m_weights[3];
+
+	pOpt_results5->m_low[0] = results5.m_low_endpoint;
+	pOpt_results5->m_high[0] = results5.m_high_endpoint;
+	pOpt_results5->m_low[0].m_c[3] = best_alpha_lo;
+	pOpt_results5->m_high[0].m_c[3] = best_alpha_hi;
 
 	pOpt_results5->m_mode = 5;
 	pOpt_results5->m_index_selector = 0;
@@ -3556,28 +4924,30 @@ static void handle_alpha_block_mode5(const varying color_quad_i *uniform pPixels
 	pOpt_results5->m_partition = 0;
 }
 
-static void handle_alpha_block(void *varying pBlock, const varying color_quad_i *uniform pPixels, const uniform bc7e_compress_block_params *uniform pComp_params, uniform color_cell_compressor_params *uniform pParams, uint32_t lo_a, uint32_t hi_a)
+static float handle_alpha_block(void *varying pBlock, const varying color_quad_i *uniform pPixels, const uniform bc7e_compress_block_params *uniform pComp_params, uniform color_cell_compressor_params *uniform pParams, uint32_t lo_a, uint32_t hi_a)
 {
-	pParams->m_perceptual = pComp_params->m_perceptual;
+	assert(pParams->m_perceptual == pComp_params->m_perceptual);
+	DEBUG_SPAM(pParams, "handle_alpha_block\n");
 
 	bc7_optimization_results opt_results;
 	
-	uint64_t best_err = UINT64_MAX;
+	float best_err = FLT_MAX;
 		
 	// Mode 4
 	if (pComp_params->m_alpha_settings.m_use_mode4)
 	{
 		uniform color_cell_compressor_params params4 = *pParams;
 
-		const uniform int num_rotations = (pComp_params->m_perceptual || (!pComp_params->m_alpha_settings.m_use_mode4_rotation)) ? 1 : 4;
+		const uniform int num_rotations = (!pComp_params->m_alpha_settings.m_use_mode4_rotation) ? 1 : 4;
 		for (uniform uint32_t rotation = 0; rotation < num_rotations; rotation++)
 		{
 			if ((pComp_params->m_mode4_rotation_mask & (1 << rotation)) == 0)
 				continue;
 
+			params4.m_rotation = rotation;
 			memcpy(params4.m_weights, pParams->m_weights, sizeof(params4.m_weights));
 			if (rotation)
-				swapu(&params4.m_weights[rotation - 1], &params4.m_weights[3]);
+				swapf(&params4.m_weights[rotation - 1], &params4.m_weights[3]);
 							
 			color_quad_i rot_pixels[16];
 			const varying color_quad_i *uniform pTrial_pixels = pPixels;
@@ -3602,12 +4972,14 @@ static void handle_alpha_block(void *varying pBlock, const varying color_quad_i 
 
 			bc7_optimization_results trial_opt_results4;
 
-			uint64_t trial_mode4_err = best_err;
+			float trial_mode4_err = best_err;
 
 			handle_alpha_block_mode4(pTrial_pixels, pComp_params, &params4, trial_lo_a, trial_hi_a, &trial_opt_results4, &trial_mode4_err);
+			DEBUG_SPAM(pParams, "  mode 4 error %\n", trial_mode4_err);
 
 			if (trial_mode4_err < best_err)
 			{
+				DEBUG_SPAM(pParams, "  *** beats old best %\n", best_err);
 				best_err = trial_mode4_err;
 
 				opt_results.m_mode = 4;
@@ -3630,6 +5002,7 @@ static void handle_alpha_block(void *varying pBlock, const varying color_quad_i 
 	// Mode 6
 	if (pComp_params->m_alpha_settings.m_use_mode6)
 	{
+		DEBUG_SPAM(pParams, " handle_alpha_block (mode 6)\n");
 		uniform color_cell_compressor_params params6 = *pParams;
 
 		params6.m_weights[0] *= pComp_params->m_alpha_settings.m_mode67_error_weight_mul[0];
@@ -3654,11 +5027,13 @@ static void handle_alpha_block(void *varying pBlock, const varying color_quad_i 
 		int selectors_temp[16];
 		results6.m_pSelectors_temp = selectors_temp;
 				
-		uint64_t mode6_err = color_cell_compression(6, &params6, &results6, pComp_params, 16, pPixels, true);
+		const float mode6_err = color_cell_compression(6, &params6, &results6, pComp_params, 16, pPixels, NULL, true);
 		assert(mode6_err == results6.m_best_overall_err);
-		
+		DEBUG_SPAM(pParams, "  modde 6 error %\n", mode6_err);
+
 		if (mode6_err < best_err)
 		{
+			DEBUG_SPAM(pParams, "  *** beats old best %\n", best_err);
 			best_err = mode6_err;
 
 			opt_results.m_mode = 6;
@@ -3682,15 +5057,16 @@ static void handle_alpha_block(void *varying pBlock, const varying color_quad_i 
 	{
 		uniform color_cell_compressor_params params5 = *pParams;
 
-		const uniform int num_rotations = (pComp_params->m_perceptual || (!pComp_params->m_alpha_settings.m_use_mode5_rotation)) ? 1 : 4;
+		const uniform int num_rotations = (!pComp_params->m_alpha_settings.m_use_mode5_rotation) ? 1 : 4;
 		for (uniform uint32_t rotation = 0; rotation < num_rotations; rotation++)
 		{
 			if ((pComp_params->m_mode5_rotation_mask & (1 << rotation)) == 0)
 				continue;
 
+			params5.m_rotation = rotation;
 			memcpy(params5.m_weights, pParams->m_weights, sizeof(params5.m_weights));
 			if (rotation)
-				swapu(&params5.m_weights[rotation - 1], &params5.m_weights[3]);
+				swapf(&params5.m_weights[rotation - 1], &params5.m_weights[3]);
 
 			color_quad_i rot_pixels[16];
 			const varying color_quad_i *uniform pTrial_pixels = pPixels;
@@ -3715,12 +5091,14 @@ static void handle_alpha_block(void *varying pBlock, const varying color_quad_i 
 
 			bc7_optimization_results trial_opt_results5;
 
-			uint64_t trial_mode5_err = 0;
+			float trial_mode5_err = best_err;
 
 			handle_alpha_block_mode5(pTrial_pixels, pComp_params, &params5, trial_lo_a, trial_hi_a, &trial_opt_results5, &trial_mode5_err);
+			DEBUG_SPAM(pParams, "  mode 5 error %\n", trial_mode5_err);
 
 			if (trial_mode5_err < best_err)
 			{
+				DEBUG_SPAM(pParams, "  *** beats old best %\n", best_err);
 				best_err = trial_mode5_err;
 
 				opt_results = trial_opt_results5;
@@ -3755,11 +5133,13 @@ static void handle_alpha_block(void *varying pBlock, const varying color_quad_i 
 		int selectors_temp[16];
 
 		const uniform bool disable_faster_part_selection = false;
+		const uniform bool refine_while_choosing = (disable_faster_part_selection || num_solutions <= 2);
 
 		for (uniform uint32_t solution_index = 0; solution_index < num_solutions; solution_index++)
 		{
 			const uint32_t trial_partition = solutions[solution_index].m_index;
 			assert(trial_partition < 64);
+			DEBUG_SPAM(pParams, " handle_alpha_block (mode 7, partition %, err est %)\n", trial_partition, solutions[solution_index].m_err);
 
 			const int *pPartition = &g_bc7_partition2[trial_partition * 16];
 
@@ -3787,7 +5167,7 @@ static void handle_alpha_block(void *varying pBlock, const varying color_quad_i 
 				subset_total_colors7[p]++;
 			}
 
-			uint64_t trial_err = 0;
+			float trial_err = 0.0f;
 			for (uniform uint32_t subset = 0; subset < 2; subset++)
 			{
 				varying color_cell_compressor_results *uniform pResults = &subset_results7[subset];
@@ -3795,16 +5175,18 @@ static void handle_alpha_block(void *varying pBlock, const varying color_quad_i 
 				pResults->m_pSelectors = &subset_selectors7[subset][0];
 				pResults->m_pSelectors_temp = selectors_temp;
 
-				uint64_t err = color_cell_compression(7, &params7, pResults, pComp_params, subset_total_colors7[subset], &subset_colors[subset][0], (num_solutions <= 2) || disable_faster_part_selection);
+				const float err = color_cell_compression(7, &params7, pResults, pComp_params, subset_total_colors7[subset], &subset_colors[subset][0], NULL, refine_while_choosing);
 				assert(err == pResults->m_best_overall_err);
 
 				trial_err += err;
 				if (trial_err > best_err)
 					break;
 			} // subset
+			DEBUG_SPAM(pParams, "  mode 7 error >= %\n", trial_err);
 
 			if (trial_err < best_err)
 			{
+				DEBUG_SPAM(pParams, "  *** beats old best %\n", best_err);
 				best_err = trial_err;
 										
 				opt_results.m_mode = 7;
@@ -3832,7 +5214,7 @@ static void handle_alpha_block(void *varying pBlock, const varying color_quad_i 
 
 		} // solution_index
 
-		if ((num_solutions > 2) && (opt_results.m_mode == 7) && (!disable_faster_part_selection))
+		if ((!refine_while_choosing) && (opt_results.m_mode == 7))
 		{
 			const uint32_t trial_partition = opt_results.m_partition;
 			assert(trial_partition < 64);
@@ -3863,7 +5245,7 @@ static void handle_alpha_block(void *varying pBlock, const varying color_quad_i 
 				subset_total_colors7[p]++;
 			}
 
-			uint64_t trial_err = 0;
+			float trial_err = 0;
 			for (uniform uint32_t subset = 0; subset < 2; subset++)
 			{
 				varying color_cell_compressor_results *uniform pResults = &subset_results7[subset];
@@ -3871,7 +5253,7 @@ static void handle_alpha_block(void *varying pBlock, const varying color_quad_i 
 				pResults->m_pSelectors = &subset_selectors7[subset][0];
 				pResults->m_pSelectors_temp = selectors_temp;
 
-				uint64_t err = color_cell_compression(7, &params7, pResults, pComp_params, subset_total_colors7[subset], &subset_colors[subset][0], true);
+				const float err = color_cell_compression(7, &params7, pResults, pComp_params, subset_total_colors7[subset], &subset_colors[subset][0], NULL, true);
 				assert(err == pResults->m_best_overall_err);
 
 				trial_err += err;
@@ -3903,20 +5285,26 @@ static void handle_alpha_block(void *varying pBlock, const varying color_quad_i 
 		}
 	}
 
+	DEBUG_SPAM(pParams, "handle_alpha_block finished\n");
+	DEBUG_SPAM_CODE(pParams, spam_bc7_block(&opt_results));
 	encode_bc7_block(pBlock, &opt_results);
+	return best_err;
 }
 
-static void handle_opaque_block(void *varying pBlock, const varying color_quad_i *uniform pPixels, const uniform bc7e_compress_block_params *uniform pComp_params, uniform color_cell_compressor_params *uniform pParams)
+static float handle_opaque_block(void *varying pBlock, const varying color_quad_i *uniform pPixels, const uniform bc7e_compress_block_params *uniform pComp_params, uniform color_cell_compressor_params *uniform pParams)
 {
+	DEBUG_SPAM(pParams, "handle_opaque_block\n");
+
 	int selectors_temp[16];
 		
 	bc7_optimization_results opt_results;
 		
-	uint64_t best_err = UINT64_MAX;
+	float best_err = FLT_MAX;
 
 	// Mode 6
 	if (pComp_params->m_opaque_settings.m_use_mode[6])
 	{
+		DEBUG_SPAM(pParams, " handle_opaque_block (mode 6)\n");
 		pParams->m_pSelector_weights = g_bc7_weights4;
 		pParams->m_pSelector_weightsx = (const vec4F * uniform)&g_bc7_weights4x[0];
 		pParams->m_num_selector_weights = 16;
@@ -3925,13 +5313,14 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 		pParams->m_has_pbits = true;
 		pParams->m_endpoints_share_pbit = false;
 
-		pParams->m_perceptual = pComp_params->m_perceptual;
+		assert(pParams->m_perceptual == pComp_params->m_perceptual);
 				
 		color_cell_compressor_results results6;						
 		results6.m_pSelectors = opt_results.m_selectors;
 		results6.m_pSelectors_temp = selectors_temp;
 
-		best_err = color_cell_compression(6, pParams, &results6, pComp_params, 16, pPixels, true);
+		best_err = color_cell_compression(6, pParams, &results6, pComp_params, 16, pPixels, NULL, true);
+		DEBUG_SPAM(pParams, "  *** best err %\n", best_err);
 						
 		opt_results.m_mode = 6;
 		opt_results.m_index_selector = 0;
@@ -3961,6 +5350,7 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 	}
 		
 	const uniform bool disable_faster_part_selection = false;
+	const uniform bool refine_while_choosing2 = (disable_faster_part_selection || num_solutions2 <= 2);
 								
 	// Mode 1
 	if (pComp_params->m_opaque_settings.m_use_mode[1])
@@ -3973,12 +5363,13 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 		pParams->m_has_pbits = true;
 		pParams->m_endpoints_share_pbit = true;
 
-		pParams->m_perceptual = pComp_params->m_perceptual;
+		assert(pParams->m_perceptual == pComp_params->m_perceptual);
 
 		for (uniform uint32_t solution_index = 0; solution_index < num_solutions2; solution_index++)
 		{
 			const uint32_t trial_partition = solutions2[solution_index].m_index;
 			assert(trial_partition < 64);
+			DEBUG_SPAM(pParams, " handle_opaque_block (mode 1, partition %)\n", trial_partition);
 
 			const int *pPartition = &g_bc7_partition2[trial_partition * 16];
 						
@@ -4006,7 +5397,7 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 				subset_total_colors1[p]++;
 			}
 								
-			uint64_t trial_err = 0;
+			float trial_err = 0.0f;
 			for (uniform uint32_t subset = 0; subset < 2; subset++)
 			{
 				varying color_cell_compressor_results *uniform pResults = &subset_results1[subset];
@@ -4014,7 +5405,7 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 				pResults->m_pSelectors = &subset_selectors1[subset][0];
 				pResults->m_pSelectors_temp = selectors_temp;
 
-				uint64_t err = color_cell_compression(1, pParams, pResults, pComp_params, subset_total_colors1[subset], &subset_colors[subset][0], (num_solutions2 <= 2) || disable_faster_part_selection);
+				const float err = color_cell_compression(1, pParams, pResults, pComp_params, subset_total_colors1[subset], &subset_colors[subset][0], NULL, refine_while_choosing2);
 				assert(err == pResults->m_best_overall_err);
 
 				trial_err += err;
@@ -4022,9 +5413,11 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 					break;
 					
 			} // subset
+			DEBUG_SPAM(pParams, "  mode 1 error %\n", trial_err);
 
 			if (trial_err < best_err)
 			{
+				DEBUG_SPAM(pParams, "  *** beats old best %\n", best_err);
 				best_err = trial_err;
 
 				opt_results.m_mode = 1;
@@ -4050,10 +5443,11 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 			}
 		}
 
-		if ((num_solutions2 > 2) && (opt_results.m_mode == 1) && (!disable_faster_part_selection))
+		if ((!refine_while_choosing2) && (opt_results.m_mode == 1))
 		{
 			const uint32_t trial_partition = opt_results.m_partition;
 			assert(trial_partition < 64);
+			DEBUG_SPAM(pParams, "  handle_opaque_block (mode 1, refine partition %)\n", trial_partition);
 
 			const int *pPartition = &g_bc7_partition2[trial_partition * 16];
 						
@@ -4081,7 +5475,7 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 				subset_total_colors1[p]++;
 			}
 								
-			uint64_t trial_err = 0;
+			float trial_err = 0.0f;
 			for (uniform uint32_t subset = 0; subset < 2; subset++)
 			{
 				varying color_cell_compressor_results *uniform pResults = &subset_results1[subset];
@@ -4089,7 +5483,7 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 				pResults->m_pSelectors = &subset_selectors1[subset][0];
 				pResults->m_pSelectors_temp = selectors_temp;
 
-				uint64_t err = color_cell_compression(1, pParams, pResults, pComp_params, subset_total_colors1[subset], &subset_colors[subset][0], true);
+				const float err = color_cell_compression(1, pParams, pResults, pComp_params, subset_total_colors1[subset], &subset_colors[subset][0], NULL, true);
 				assert(err == pResults->m_best_overall_err);
 
 				trial_err += err;
@@ -4097,9 +5491,11 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 					break;
 					
 			} // subset
+			DEBUG_SPAM(pParams, "  mode 1 refinement error %\n", trial_err);
 
 			if (trial_err < best_err)
 			{
+				DEBUG_SPAM(pParams, "  *** beats old best %\n", best_err);
 				best_err = trial_err;
 
 				for (uniform uint32_t subset = 0; subset < 2; subset++)
@@ -4143,11 +5539,12 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 		pParams->m_has_pbits = true;
 		pParams->m_endpoints_share_pbit = false;
 
-		pParams->m_perceptual = pComp_params->m_perceptual;
+		assert(pParams->m_perceptual == pComp_params->m_perceptual);
 				
 		for (uniform uint32_t solution_index = 0; solution_index < num_solutions3; solution_index++)
 		{
 			const uint32_t best_partition0 = solutions3[solution_index].m_index;
+			DEBUG_SPAM(pParams, " handle_opaque_block (mode 1, partition %)\n", best_partition0);
 
 			const int *pPartition = &g_bc7_partition3[best_partition0 * 16];
 
@@ -4176,7 +5573,7 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 			color_cell_compressor_results subset_results0[3];
 			int subset_selectors0[3][16];			
 
-			uint64_t mode0_err = 0;
+			float mode0_err = 0.0f;
 			for (uniform uint32_t subset = 0; subset < 3; subset++)
 			{
 				varying color_cell_compressor_results *uniform pResults = &subset_results0[subset];
@@ -4184,16 +5581,18 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 				pResults->m_pSelectors = &subset_selectors0[subset][0];
 				pResults->m_pSelectors_temp = selectors_temp;
 
-				uint64_t err = color_cell_compression(0, pParams, pResults, pComp_params, subset_total_colors0[subset], &subset_colors[subset][0], true);
+				const float err = color_cell_compression(0, pParams, pResults, pComp_params, subset_total_colors0[subset], &subset_colors[subset][0], NULL, true);
 				assert(err == pResults->m_best_overall_err);
 
 				mode0_err += err;
 				if (mode0_err > best_err)
 					break;
 			} // subset
+			DEBUG_SPAM(pParams, "  mode 0 error %\n", mode0_err);
 
 			if (mode0_err < best_err)
 			{
+				DEBUG_SPAM(pParams, "  *** beats old best %\n", best_err);
 				best_err = mode0_err;
 
 				opt_results.m_mode = 0;
@@ -4232,12 +5631,13 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 		pParams->m_has_pbits = true;
 		pParams->m_endpoints_share_pbit = false;
 
-		pParams->m_perceptual = pComp_params->m_perceptual;
+		assert(pParams->m_perceptual == pComp_params->m_perceptual);
 
 		for (uniform uint32_t solution_index = 0; solution_index < num_solutions2; solution_index++)
 		{
 			const uint32_t trial_partition = solutions2[solution_index].m_index;
 			assert(trial_partition < 64);
+			DEBUG_SPAM(pParams, " handle_opaque_block (mode 3, partition %)\n", trial_partition);
 
 			const int *pPartition = &g_bc7_partition2[trial_partition * 16];
 
@@ -4267,7 +5667,7 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 				subset_total_colors3[p]++;
 			}
 
-			uint64_t trial_err = 0;
+			float trial_err = 0.0f;
 			for (uniform uint32_t subset = 0; subset < 2; subset++)
 			{
 				varying color_cell_compressor_results *uniform pResults = &subset_results3[subset];
@@ -4275,16 +5675,18 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 				pResults->m_pSelectors = &subset_selectors3[subset][0];
 				pResults->m_pSelectors_temp = selectors_temp;
 
-				uint64_t err = color_cell_compression(3, pParams, pResults, pComp_params, subset_total_colors3[subset], &subset_colors[subset][0], (num_solutions2 <= 2) || disable_faster_part_selection);
+				const float err = color_cell_compression(3, pParams, pResults, pComp_params, subset_total_colors3[subset], &subset_colors[subset][0], NULL, refine_while_choosing2);
 				assert(err == pResults->m_best_overall_err);
 
 				trial_err += err;
 				if (trial_err > best_err)
 					break;
 			} // subset
+			DEBUG_SPAM(pParams, "  mode 3 error %\n", trial_err);
 
 			if (trial_err < best_err)
 			{
+				DEBUG_SPAM(pParams, "  *** beats old best %\n", best_err);
 				best_err = trial_err;
 										
 				opt_results.m_mode = 3;
@@ -4312,10 +5714,11 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 
 		} // solution_index
 
-		if ((num_solutions2 > 2) && (opt_results.m_mode == 3) && (!disable_faster_part_selection))
+		if ((!refine_while_choosing2) && (opt_results.m_mode == 3))
 		{
 			const uint32_t trial_partition = opt_results.m_partition;
 			assert(trial_partition < 64);
+			DEBUG_SPAM(pParams, " handle_opaque_block (mode 3, partition % refinement)\n", trial_partition);
 
 			const int *pPartition = &g_bc7_partition2[trial_partition * 16];
 
@@ -4345,7 +5748,7 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 				subset_total_colors3[p]++;
 			}
 
-			uint64_t trial_err = 0;
+			float trial_err = 0.0f;
 			for (uniform uint32_t subset = 0; subset < 2; subset++)
 			{
 				varying color_cell_compressor_results *uniform pResults = &subset_results3[subset];
@@ -4353,16 +5756,18 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 				pResults->m_pSelectors = &subset_selectors3[subset][0];
 				pResults->m_pSelectors_temp = selectors_temp;
 
-				uint64_t err = color_cell_compression(3, pParams, pResults, pComp_params, subset_total_colors3[subset], &subset_colors[subset][0], true);
+				const float err = color_cell_compression(3, pParams, pResults, pComp_params, subset_total_colors3[subset], &subset_colors[subset][0], NULL, true);
 				assert(err == pResults->m_best_overall_err);
 
 				trial_err += err;
 				if (trial_err > best_err)
 					break;
 			} // subset
+			DEBUG_SPAM(pParams, "  mode 3 refinement error %\n", trial_err);
 
 			if (trial_err < best_err)
 			{
+				DEBUG_SPAM(pParams, "  *** beats old best %\n", best_err);
 				best_err = trial_err;
 										
 				for (uniform uint32_t subset = 0; subset < 2; subset++)
@@ -4386,7 +5791,7 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 	}
 
 	// Mode 5
-	if ((!pComp_params->m_perceptual) && (pComp_params->m_opaque_settings.m_use_mode[5]))
+	if (pComp_params->m_opaque_settings.m_use_mode[5])
 	{
 		uniform color_cell_compressor_params params5 = *pParams;
 
@@ -4395,9 +5800,10 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 			if ((pComp_params->m_mode5_rotation_mask & (1 << rotation)) == 0)
 				continue;
 
+			params5.m_rotation = rotation;
 			memcpy(params5.m_weights, pParams->m_weights, sizeof(params5.m_weights));
 			if (rotation)
-				swapu(&params5.m_weights[rotation - 1], &params5.m_weights[3]);
+				swapf(&params5.m_weights[rotation - 1], &params5.m_weights[3]);
 
 			color_quad_i rot_pixels[16];
 			const varying color_quad_i *uniform pTrial_pixels = pPixels;
@@ -4422,12 +5828,14 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 
 			bc7_optimization_results trial_opt_results5;
 
-			uint64_t trial_mode5_err = 0;
+			float trial_mode5_err = 0.0f;
 
 			handle_alpha_block_mode5(pTrial_pixels, pComp_params, &params5, trial_lo_a, trial_hi_a, &trial_opt_results5, &trial_mode5_err);
+			DEBUG_SPAM(pParams, "  mode 5 error %\n", trial_mode5_err);
 
 			if (trial_mode5_err < best_err)
 			{
+				DEBUG_SPAM(pParams, "  *** beats old best %\n", best_err);
 				best_err = trial_mode5_err;
 
 				opt_results = trial_opt_results5;
@@ -4459,11 +5867,12 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 		pParams->m_has_pbits = false;
 		pParams->m_endpoints_share_pbit = false;
 
-		pParams->m_perceptual = pComp_params->m_perceptual;
+		assert(pParams->m_perceptual == pComp_params->m_perceptual);
 
 		for (uniform uint32_t solution_index = 0; solution_index < num_solutions3; solution_index++)
 		{
 			const int32_t best_partition2 = solutions3[solution_index].m_index;
+			DEBUG_SPAM(pParams, " handle_opaque_block (mode 2, partition %)\n", best_partition2);
 						
 			uint32_t subset_total_colors2[3];
 			subset_total_colors2[0] = 0;
@@ -4494,7 +5903,7 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 			int subset_selectors2[3][16];
 			color_cell_compressor_results subset_results2[3];
 						
-			uint64_t mode2_err = 0;
+			float mode2_err = 0.0f;
 			for (uniform uint32_t subset = 0; subset < 3; subset++)
 			{
 				varying color_cell_compressor_results *uniform pResults = &subset_results2[subset];
@@ -4502,16 +5911,18 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 				pResults->m_pSelectors = &subset_selectors2[subset][0];
 				pResults->m_pSelectors_temp = selectors_temp;
 
-				uint64_t err = color_cell_compression(2, pParams, pResults, pComp_params, subset_total_colors2[subset], &subset_colors[subset][0], true);
+				const float err = color_cell_compression(2, pParams, pResults, pComp_params, subset_total_colors2[subset], &subset_colors[subset][0], NULL, true);
 				assert(err == pResults->m_best_overall_err);
 
 				mode2_err += err;
 				if (mode2_err > best_err)
 					break;
 			} // subset
+			DEBUG_SPAM(pParams, "  mode 2 error %\n", mode2_err);
 
 			if (mode2_err < best_err)
 			{
+				DEBUG_SPAM(pParams, "  *** beats old best %\n", best_err);
 				best_err = mode2_err;
 
 				opt_results.m_mode = 2;
@@ -4537,7 +5948,7 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 	}
 
 	// Mode 4
-	if ((!pComp_params->m_perceptual) && (pComp_params->m_opaque_settings.m_use_mode[4]))
+	if (pComp_params->m_opaque_settings.m_use_mode[4])
 	{
 		uniform color_cell_compressor_params params4 = *pParams;
 
@@ -4546,9 +5957,10 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 			if ((pComp_params->m_mode4_rotation_mask & (1 << rotation)) == 0)
 				continue;
 
+			params4.m_rotation = rotation;
 			memcpy(params4.m_weights, pParams->m_weights, sizeof(params4.m_weights));
 			if (rotation)
-				swapu(&params4.m_weights[rotation - 1], &params4.m_weights[3]);
+				swapf(&params4.m_weights[rotation - 1], &params4.m_weights[3]);
 							
 			color_quad_i rot_pixels[16];
 			const varying color_quad_i *uniform pTrial_pixels = pPixels;
@@ -4573,12 +5985,14 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 
 			bc7_optimization_results trial_opt_results4;
 
-			uint64_t trial_mode4_err = best_err;
+			float trial_mode4_err = best_err;
 
 			handle_alpha_block_mode4(pTrial_pixels, pComp_params, &params4, trial_lo_a, trial_hi_a, &trial_opt_results4, &trial_mode4_err);
+			DEBUG_SPAM(pParams, "  mode 4 error %\n", trial_mode4_err);
 
 			if (trial_mode4_err < best_err)
 			{
+				DEBUG_SPAM(pParams, "  *** beats old best %\n", best_err);
 				best_err = trial_mode4_err;
 
 				opt_results.m_mode = 4;
@@ -4598,11 +6012,14 @@ static void handle_opaque_block(void *varying pBlock, const varying color_quad_i
 		} // rotation
 	}
 	
+	DEBUG_SPAM(pParams, "handle_opaque_block finished\n");
+	DEBUG_SPAM_CODE(pParams, spam_bc7_block(&opt_results));
 	encode_bc7_block(pBlock, &opt_results);
+	return best_err;
 }
 
 // all solid color blocks can be 100% perfectly encoded with just mode 5
-static void handle_block_solid(void *varying pBlock, uint32_t cr, uint32_t cg, uint32_t cb, uint32_t ca)
+static float handle_block_solid(void *varying pBlock, uint32_t cr, uint32_t cg, uint32_t cb, uint32_t ca)
 {
 	#pragma ignore warning(perf)
 	uint32_t er = g_bc7_mode_5_optimal_endpoints[cr];
@@ -4628,16 +6045,15 @@ static void handle_block_solid(void *varying pBlock, uint32_t cr, uint32_t cg, u
 	for (uniform int i = 0; i < 16; ++i)
 		opt.m_alpha_selectors[i] = 0;
 	encode_bc7_block(pBlock, &opt);
+	return 0.0f;
 }
 
-static void handle_opaque_block_mode6(void *varying pBlock, const varying color_quad_i *uniform pPixels, const uniform bc7e_compress_block_params *uniform pComp_params, uniform color_cell_compressor_params *uniform pParams)
+static float handle_opaque_block_mode6(void *varying pBlock, const varying color_quad_i *uniform pPixels, const uniform bc7e_compress_block_params *uniform pComp_params, uniform color_cell_compressor_params *uniform pParams)
 {
 	int selectors_temp[16];
 		
 	bc7_optimization_results opt_results;
 		
-	uint64_t best_err = UINT64_MAX;
-
 	// Mode 6
 	pParams->m_pSelector_weights = g_bc7_weights4;
 	pParams->m_pSelector_weightsx = (const vec4F * uniform)&g_bc7_weights4x[0];
@@ -4647,14 +6063,14 @@ static void handle_opaque_block_mode6(void *varying pBlock, const varying color_
 	pParams->m_has_pbits = true;
 	pParams->m_endpoints_share_pbit = false;
 
-	pParams->m_perceptual = pComp_params->m_perceptual;
-				
-	color_cell_compressor_results results6;						
+	assert(pParams->m_perceptual == pComp_params->m_perceptual);
+
+	color_cell_compressor_results results6;
 	results6.m_pSelectors = opt_results.m_selectors;
 	results6.m_pSelectors_temp = selectors_temp;
 
-	best_err = color_cell_compression(6, pParams, &results6, pComp_params, 16, pPixels, true);
-						
+	const float best_err = color_cell_compression(6, pParams, &results6, pComp_params, 16, pPixels, NULL, true);
+
 	opt_results.m_mode = 6;
 	opt_results.m_index_selector = 0;
 	opt_results.m_rotation = 0;
@@ -4667,6 +6083,7 @@ static void handle_opaque_block_mode6(void *varying pBlock, const varying color_
 	opt_results.m_pbits[0][1] = results6.m_pbits[1];
 		
 	encode_bc7_block_mode6(pBlock, &opt_results);
+	return best_err;
 }
 
 export void bc7e_compress_blocks(uniform uint32_t num_blocks, uniform uint64_t * uniform pBlocks, const uniform uint32_t * uniform pPixelsRGBA, const uniform bc7e_compress_block_params * uniform pComp_params)
@@ -4684,7 +6101,61 @@ export void bc7e_compress_blocks(uniform uint32_t num_blocks, uniform uint64_t *
 	uniform color_cell_compressor_params params;
 	color_cell_compressor_params_clear(&params);
 
+	params.m_debug_spam = pComp_params->m_debugSpam;
+
 	memcpy(params.m_weights, pComp_params->m_weights, sizeof(params.m_weights));
+	params.m_perceptual = pComp_params->m_perceptual;
+	params.m_optimize_for_color_times_alpha = (pComp_params->m_optimize_for != BC7E_OPTIMIZE_FOR_INDEPENDENT_CHANNELS);
+	params.m_frame_buffer_other_value = (pComp_params->m_optimize_for == BC7E_OPTIMIZE_FOR_ALPHA_BLENDING) ? 255.0f : 0.0f;
+	if (pComp_params->m_optimize_for == BC7E_OPTIMIZE_FOR_ALPHA_TEST)
+	{
+		const uniform float H = ceil(pComp_params->m_alpha_test_threshold_max);
+		const uniform float L = min(floor(pComp_params->m_alpha_test_threshold_min), H - 1.0f);
+		params.m_alpha_scale = 255.0f / (H - L);
+		params.m_alpha_bias = L;
+	}
+	else
+	{
+		params.m_alpha_scale = 1.0f;
+		params.m_alpha_bias = 0.0f;
+	}
+	if (params.m_optimize_for_color_times_alpha)
+	{
+		params.m_weights[3] = params.m_weights[0] + params.m_weights[1] + params.m_weights[2];
+		if (params.m_perceptual && params.m_optimize_for_color_times_alpha)
+		{
+			// Need to initialize perceptual constants that depend on m_weights
+			const uniform float sqrt_wt_y = sqrt((float)pComp_params->m_weights[0]);
+			const uniform float sqrt_wt_cr = sqrt((float)pComp_params->m_weights[1]);
+			const uniform float sqrt_wt_cb = sqrt((float)pComp_params->m_weights[2]);
+			params.m_sqrt_weights.m_c[0] = sqrt_wt_y;
+			params.m_sqrt_weights.m_c[1] = sqrt_wt_cr * k_norm_Cr;
+			params.m_sqrt_weights.m_c[2] = sqrt_wt_cb * k_norm_Cb;
+			if (pComp_params->m_optimize_for == BC7E_OPTIMIZE_FOR_ALPHA_BLENDING)
+			{
+				// Minimizing alpha blending error needs the parallelepiped basis vectors
+				params.m_dycrcb_r.m_c[0] = (k_Y_R  * 255) * sqrt_wt_y;
+				params.m_dycrcb_r.m_c[1] = (k_Cr_R * 255) * sqrt_wt_cr;
+				params.m_dycrcb_r.m_c[2] = (k_Cb_R * 255) * sqrt_wt_cb;
+				params.m_dycrcb_g.m_c[0] = (k_Y_G  * 255) * sqrt_wt_y;
+				params.m_dycrcb_g.m_c[1] = (k_Cr_G * 255) * sqrt_wt_cr;
+				params.m_dycrcb_g.m_c[2] = (k_Cb_G * 255) * sqrt_wt_cb;
+				params.m_dycrcb_b.m_c[0] = (k_Y_B  * 255) * sqrt_wt_y;
+				params.m_dycrcb_b.m_c[1] = (k_Cr_B * 255) * sqrt_wt_cr;
+				params.m_dycrcb_b.m_c[2] = (k_Cb_B * 255) * sqrt_wt_cb;
+				params.m_dycrcb_mid = 127.5f * sqrt_wt_y;
+			}
+			else
+			{
+				// Minimizing color * alpha error needs to ignore the parallelepiped, which leaves the basis vectors zero
+				assert(pComp_params->m_optimize_for == BC7E_OPTIMIZE_FOR_COLOR_TIMES_ALPHA);
+				assert(params.m_dycrcb_r.m_c[0] == 0.0f);
+				assert(params.m_dycrcb_g.m_c[1] == 0.0f);
+				assert(params.m_dycrcb_b.m_c[2] == 0.0f);
+				assert(params.m_dycrcb_mid == 0.0f);
+			}
+		}
+	}
 
 	assert(pComp_params->m_mode4_rotation_mask != 0);
 	assert(pComp_params->m_mode4_index_mask != 0);
@@ -4730,23 +6201,29 @@ export void bc7e_compress_blocks(uniform uint32_t num_blocks, uniform uint64_t *
 		bool all_same = lo_r==hi_r && lo_g==hi_g && lo_b==hi_b && lo_a==hi_a;
 
 		uniform uint64_t *varying pBlock = &pBlocks[block_index * 2];
-			
+
+		float best_err;
 		cif (all_same)
-			handle_block_solid(pBlock, lo_r, lo_g, lo_b, lo_a);
+		{
+#pragma ignore warning(perf)
+			best_err = handle_block_solid(pBlock, lo_r, lo_g, lo_b, lo_a);
+		}
 		else
 		{
 			const bool has_alpha = (lo_a < 255);
 			// TODO: alpha block mode 6 only
 			cif (has_alpha)
-				handle_alpha_block(pBlock, temp_pixels, pComp_params, &params, (int)lo_a, (int)hi_a);
+				best_err = handle_alpha_block(pBlock, temp_pixels, pComp_params, &params, (int)lo_a, (int)hi_a);
 			else
 			{
 				if (pComp_params->m_mode6_only)
-					handle_opaque_block_mode6(pBlock, temp_pixels, pComp_params, &params);
+					best_err = handle_opaque_block_mode6(pBlock, temp_pixels, pComp_params, &params);
 				else
-					handle_opaque_block(pBlock, temp_pixels, pComp_params, &params);
+					best_err = handle_opaque_block(pBlock, temp_pixels, pComp_params, &params);
 			}
 		}
+		if (pComp_params->m_block_error_metric_results != NULL)
+			pComp_params->m_block_error_metric_results[block_index] = best_err;
 	}
 }
 
@@ -4764,21 +6241,23 @@ export void bc7e_compress_block_params_init(bc7e_compress_block_params * uniform
 	p->m_perceptual = perceptual;
 	if (perceptual)
 	{
-		p->m_weights[0] = 128;
-		p->m_weights[1] = 64;
-		p->m_weights[2] = 16;
-		p->m_weights[3] = 256;
+		p->m_weights[0] = 128.0f;
+		p->m_weights[1] = 64.0f;
+		p->m_weights[2] = 16.0f;
+		p->m_weights[3] = 256.0f;
 	}
 	else
 	{
-		p->m_weights[0] = 1;
-		p->m_weights[1] = 1;
-		p->m_weights[2] = 1;
-		p->m_weights[3] = 1;
+		p->m_weights[0] = 1.0f;
+		p->m_weights[1] = 1.0f;
+		p->m_weights[2] = 1.0f;
+		p->m_weights[3] = 1.0f;
 	}
 
+	p->m_optimize_for = BC7E_OPTIMIZE_FOR_INDEPENDENT_CHANNELS;
 	p->m_pbit_search = false;
 	p->m_mode6_only = false;
+	p->m_debugSpam = false;
 	p->m_refinement_passes = 1;
 	p->m_mode4_rotation_mask = 0xF;
 	p->m_mode4_index_mask = 3;
@@ -4796,11 +6275,13 @@ export void bc7e_compress_block_params_init(bc7e_compress_block_params * uniform
 	p->m_alpha_settings.m_use_mode4_rotation = true;
 	p->m_alpha_settings.m_use_mode5_rotation = true;
 	p->m_alpha_settings.m_max_mode7_partitions_to_try = 1;
-	p->m_alpha_settings.m_mode67_error_weight_mul[0] = 1;
-	p->m_alpha_settings.m_mode67_error_weight_mul[1] = 1;
-	p->m_alpha_settings.m_mode67_error_weight_mul[2] = 1;
-	p->m_alpha_settings.m_mode67_error_weight_mul[3] = 1;
+	p->m_alpha_settings.m_mode67_error_weight_mul[0] = 1.0f;
+	p->m_alpha_settings.m_mode67_error_weight_mul[1] = 1.0f;
+	p->m_alpha_settings.m_mode67_error_weight_mul[2] = 1.0f;
+	p->m_alpha_settings.m_mode67_error_weight_mul[3] = 1.0f;
 	p->m_uber_level = 0;
+
+	p->m_block_error_metric_results = NULL;
 }
 
 export void bc7e_compress_block_params_init_slowest(bc7e_compress_block_params * uniform p, uniform bool perceptual)
