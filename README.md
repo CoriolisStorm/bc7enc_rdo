@@ -14,6 +14,28 @@ This repo was originally derived from [bc7enc](https://github.com/richgel999/bc7
 
 **Note: If you use this software in a product, attribution / credits is requested but not required. Thanks!**
 
+### Differences from Rich Geldreich's BC7E
+
+(This is the only section I modified from his readme. He deserves the credit for BC7E; I just improved it.)
+
+The only file changed is bc7e.ispc, to improve BC7 compression.
+
+The biggest image quality improvement is a new way of measuring error that tries to minimize the final frame buffer error after blending by treating color and alpha error together, rather than as independent channels. This really dramatically reduces blocking artifacts in some alpha images, with no user-tweaked parameters. The only user setting is how color and alpha are to be used, which is one of four intuitive choices -- and in Apex Legends, our code already knows this without further artist intervention. In addition, the alpha blended and alpha tested error metrics don't even need you to set the alpha weight relative to RGB weights! That's because it optimizes color and alpha together based on the worst case color error after blending with the frame buffer, either in RGB or in YCbCr color space. Since it's minimizing color error after blending, alpha error is implicitly handled by the color error weights.
+
+The four choices are BC7E_OPTIMIZE_FOR_INDEPENDENT_CHANNELS, BC7E_OPTIMIZE_FOR_COLOR_TIMES_ALPHA, BC7E_OPTIMIZE_FOR_ALPHA_BLENDING, and BC7E_OPTIMIZE_FOR_ALPHA_TEST. The default behavior is independent channels, which is what BC7E did before.
+
+I also did some improvements to the color partition selector that reduce overall error.
+
+I improved the perceptual compressor by supporting rotation and by using the YPbPr weights for sRGB (in gamma space) rather than the weights for linear RGB. Using the original linear weights is a simple #if change. The images that we compress for GPUs are almost universally expected to be in sRGB.
+
+One other improvement is to make bc7e optionally return the error for each block. Apex Legends used this to recompress just the really low quality blocks with the uber quality setting. This gives most of the benefit of uber quality in a fraction of the time.
+
+The per-channel error weights you give BC7E are now floats instead of integers.
+
+I tried to keep the API the same as Rich Geldreich's original BC7E with additions that default to old behavior, so this should be an easy drop-in replacement.
+
+See submit comments for bc7e.ispc for many more details and other smaller improvements. I also put derivations and other comments in bc7e.ispc itself.
+
 ### Compiling
 
 This build has been tested with MSVC 2019 x64 and clang 6.0.0 under Ubuntu v18.04.
